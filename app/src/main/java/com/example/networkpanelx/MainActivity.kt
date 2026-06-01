@@ -1,12 +1,21 @@
-﻿package com.example.networkpanelx
+package com.example.networkpanelx
 
 import android.app.Activity
 import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.os.Bundle
+import com.google.android.gms.net.CronetProviderInstaller
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -16,11 +25,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.foundation.clickable
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -42,15 +54,18 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.core.view.WindowCompat
+import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -65,24 +80,41 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
+import okhttp3.CacheControl
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
+import org.chromium.net.CronetEngine
+import org.chromium.net.CronetException
+import org.chromium.net.UrlRequest
+import org.chromium.net.UrlResponseInfo
+import java.io.InputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resumeWithException
+import kotlin.coroutines.resume
 import kotlin.math.max
-import kotlin.random.Random
 
 private const val PREFS_NAME = "traffic_prefs"
 private const val PREF_LINKS = "links_json"
 private const val PREF_THEME_DARK = "theme_dark"
-private const val TEST_CHUNK_SIZE_BYTES = 8L * 1024L * 1024L
-private const val READ_BUFFER_SIZE = 256 * 1024
+private const val PREF_THREAD_COUNT = "thread_count"
+private const val READ_BUFFER_SIZE = 1024 * 1024
+private const val MAX_EFFECTIVE_CONCURRENCY = 64
+private const val CRONET_FAILURE_THRESHOLD = 3
+private const val RANGE_CHUNK_SIZE_BYTES = 32L * 1024L * 1024L
+private const val FAST_RETRY_DELAY_MS = 0L
+private const val WORKER_STAGGER_MS = 8L
 
 data class LinkItem(
     val id: Long,
@@ -110,13 +142,19 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(
                 colorScheme = if (vm.isDarkTheme) {
                     darkColorScheme(
-                        background = Color(0xFF121212),
-                        surface = Color(0xFF1E1E1E),
+                        primary = Color(0xFF8AB4F8),
+                        secondary = Color(0xFF80CBC4),
+                        background = Color(0xFF0F172A),
+                        surface = Color(0xFF1E293B),
+                        surfaceVariant = Color(0xFF334155),
                     )
                 } else {
                     lightColorScheme(
-                        background = Color(0xFFF5F5F5),
+                        primary = Color(0xFF2563EB),
+                        secondary = Color(0xFF0891B2),
+                        background = Color(0xFFF1F5F9),
                         surface = Color.White,
+                        surfaceVariant = Color(0xFFE2E8F0),
                     )
                 },
             ) {
@@ -133,6 +171,10 @@ class MainActivity : ComponentActivity() {
 }
 
 class TrafficViewModel(app: Application) : AndroidViewModel(app) {
+    companion object {
+        private const val TAG = "TrafficViewModel"
+    }
+
     var links by mutableStateOf(emptyList<LinkItem>())
         private set
 
@@ -170,6 +212,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private var nextId = 1L
     private var runJob: Job? = null
     private var activeRunTargets: Map<Long, Long> = emptyMap()
+    private val cronetConsecutiveFailures = AtomicLong(0L)
+    private var cronetTemporarilyDisabled = false
     private val clientDispatcher = Dispatcher().apply {
         maxRequests = 128
         maxRequestsPerHost = 128
@@ -181,16 +225,24 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         .dispatcher(clientDispatcher)
         .connectionPool(ConnectionPool(128, 5, TimeUnit.MINUTES))
         .build()
+    private var cronetEngine: CronetEngine? = null
+    private var cronetReadyAttempted = false
 
     init {
         loadLinks()
         loadTheme()
+        loadThreadCount()
         nextId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
     }
 
     fun updateThreadCount(value: Int) {
         if (isRunning) return
         threadCount = value.coerceIn(1, 64)
+        getApplication<Application>()
+            .getSharedPreferences(PREFS_NAME, 0)
+            .edit()
+            .putInt(PREF_THREAD_COUNT, threadCount)
+            .apply()
     }
 
     fun toggleKeepAlive() {
@@ -273,6 +325,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         isRunning = false
         statusText = "已暂停"
         currentSpeedBytesPerSec = 0L
+        cronetConsecutiveFailures.set(0L)
+        cronetTemporarilyDisabled = false
         syncKeepAliveService()
         links = links.map {
             if (it.status == "运行中") it.copy(status = "已停止") else it
@@ -293,6 +347,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         activeRunTargets = parsed.associate { it.id to it.targetBytes }
+        cronetConsecutiveFailures.set(0L)
+        cronetTemporarilyDisabled = false
         totalTargetBytes = parsed.sumOf { it.targetBytes }
         totalConsumedBytes = parsed.sumOf { minOf(it.initialConsumedBytes, it.targetBytes) }
         currentTaskName = "-"
@@ -398,29 +454,77 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    private suspend fun probeRangeSupport(url: String): Pair<Boolean, Long> = withContext(Dispatchers.IO) {
+        val userAgent = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
+        try {
+            val request = Request.Builder()
+                .url(url)
+                .head()
+                .header("User-Agent", userAgent)
+                .build()
+            httpClient.newCall(request).execute().use { response ->
+                val length = response.header("Content-Length")?.toLongOrNull() ?: response.body?.contentLength() ?: -1L
+                val acceptRanges = response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
+                if (response.isSuccessful && acceptRanges && length > RANGE_CHUNK_SIZE_BYTES) {
+                    return@withContext true to length
+                }
+            }
+        } catch (_: Exception) {
+            // Some CDN links, including cloud.139.com APK links, reject HEAD with 403
+            // but still support byte ranges. Fall through to a 1-byte range probe.
+        }
+
+        try {
+            val request = Request.Builder()
+                .url(url)
+                .get()
+                .header("User-Agent", userAgent)
+                .header("Range", "bytes=0-0")
+                .header("Accept", "*/*")
+                .build()
+            httpClient.newCall(request).execute().use { response ->
+                val contentRange = response.header("Content-Range").orEmpty()
+                val totalLength = contentRange.substringAfter('/', "").toLongOrNull() ?: -1L
+                if (response.code == 206 && totalLength > RANGE_CHUNK_SIZE_BYTES) {
+                    return@withContext true to totalLength
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        false to -1L
+    }
+
     private suspend fun consumeTask(task: ParsedTask, threads: Int) {
         val consumed = AtomicLong(task.initialConsumedBytes)
         var lastBytes = task.initialConsumedBytes
         var lastTime = System.currentTimeMillis()
+        var smoothedSpeed = 0L
         val lastProgressAt = AtomicLong(System.currentTimeMillis())
         val firstError = AtomicReference<String?>(null)
-        val endpoint = probeEndpoint(task.url)
+        val (supportsRange, contentLength) = probeRangeSupport(task.url)
+        val nextRangeStart = AtomicLong(0L)
 
         coroutineScope {
             val progressJob = launch(Dispatchers.Default) {
                 while (currentCoroutineContext().isActive) {
-                    delay(500)
+                    delay(1000)
                     val now = System.currentTimeMillis()
                     val snapshot = consumed.get().coerceAtMost(task.targetBytes)
                     val dt = max(1L, now - lastTime)
                     val delta = (snapshot - lastBytes).coerceAtLeast(0L)
-                    val speed = (delta * 1000L) / dt
+                    val instantSpeed = (delta * 1000L) / dt
+                    smoothedSpeed = when {
+                        smoothedSpeed <= 0L -> instantSpeed
+                        instantSpeed <= 0L -> (smoothedSpeed * 7L) / 10L
+                        else -> ((smoothedSpeed * 7L) + (instantSpeed * 3L)) / 10L
+                    }
                     lastBytes = snapshot
                     lastTime = now
 
                     withContext(Dispatchers.Main) {
                         currentTaskConsumed = snapshot
-                        currentSpeedBytesPerSec = speed
+                        currentSpeedBytesPerSec = smoothedSpeed
                         updateConsumed(task.id, snapshot)
                     }
 
@@ -428,52 +532,77 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 }
             }
 
-            repeat(threads.coerceIn(1, 64)) {
+            val effectiveThreads = threads.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
+            repeat(effectiveThreads) { index ->
                 launch(Dispatchers.IO) {
                     val buffer = ByteArray(READ_BUFFER_SIZE)
+                    val downloadClient = buildDownloadClient()
+                    delay(index * WORKER_STAGGER_MS)
                     while (currentCoroutineContext().isActive && consumed.get() < task.targetBytes) {
-                        val requestBuilder = Request.Builder()
-                            .url(task.url)
-                            .get()
-                            .header("Cache-Control", "no-cache")
-                            .header("Pragma", "no-cache")
-                            .header("Accept-Encoding", "identity")
-                            .header("Connection", "keep-alive")
-                            .header("User-Agent", "Mozilla/5.0 (Android)")
-
-                        if (endpoint.supportsRange && endpoint.contentLength > 0L) {
-                            val maxStart = (endpoint.contentLength - TEST_CHUNK_SIZE_BYTES).coerceAtLeast(0L)
-                            val start = if (maxStart > 0L) Random.nextLong(maxStart + 1L) else 0L
-                            val end = minOf(endpoint.contentLength - 1L, start + TEST_CHUNK_SIZE_BYTES - 1L)
-                            requestBuilder.header("Range", "bytes=$start-$end")
-                        }
-
                         try {
-                            val call = httpClient.newCall(requestBuilder.build())
-                            call.execute().use { resp ->
-                                if (!resp.isSuccessful) {
-                                    val message = "HTTP ${resp.code}"
+                            val cronet: CronetEngine? = null
+                            if (cronet != null) {
+                                val statusCode = downloadWithCronet(
+                                    engine = cronet,
+                                    url = task.url,
+                                    targetCounter = consumed,
+                                    targetBytes = task.targetBytes,
+                                    onBytesRead = { bytesRead ->
+                                        addConsumedSafely(consumed, task.targetBytes, bytesRead)
+                                        lastProgressAt.set(System.currentTimeMillis())
+                                    },
+                                )
+                                cronetConsecutiveFailures.set(0L)
+                                if (statusCode !in 200..299) {
+                                    val message = "HTTP $statusCode"
                                     firstError.compareAndSet(null, message)
-                                    if (resp.code in 400..499) {
-                                        currentCoroutineContext().cancelChildren()
-                                        throw IllegalStateException("请求失败：$message")
-                                    }
-                                    delay(120)
-                                    return@use
+                                    if (statusCode in 400..499) {
+                                        throw FatalRequestException("请求失败：$message")
                                 }
-                                val body = resp.body ?: return@use
-                                val stream = body.byteStream()
-                                while (currentCoroutineContext().isActive && consumed.get() < task.targetBytes) {
-                                    val read = stream.read(buffer)
-                                    if (read <= 0) break
-                                    if (consumed.get() >= task.targetBytes) break
-                                    addConsumedSafely(consumed, task.targetBytes, read.toLong())
-                                    lastProgressAt.set(System.currentTimeMillis())
+                                delay(FAST_RETRY_DELAY_MS)
+                                continue
+                            }
+                        } else {
+                                val rangeHeader = nextRangeHeader(supportsRange, contentLength, nextRangeStart)
+                                openDownloadStream(task.url, rangeHeader, downloadClient).use { streamResult ->
+                                    if (streamResult.code !in 200..299) {
+                                        val message = "HTTP ${streamResult.code}"
+                                        firstError.compareAndSet(null, message)
+                                        if (streamResult.code in 400..499) {
+                                            throw FatalRequestException("请求失败：$message")
+                                        }
+                                        delay(FAST_RETRY_DELAY_MS)
+                                        return@use
+                                    }
+                                    val stream = streamResult.inputStream ?: return@use
+                                    while (currentCoroutineContext().isActive && consumed.get() < task.targetBytes) {
+                                        val read = stream.read(buffer)
+                                        if (read <= 0) break
+                                        if (consumed.get() >= task.targetBytes) break
+                                        addConsumedSafely(consumed, task.targetBytes, read.toLong())
+                                        lastProgressAt.set(System.currentTimeMillis())
+                                    }
                                 }
                             }
+                            if (currentCoroutineContext().isActive && consumed.get() < task.targetBytes) {
+                                delay(FAST_RETRY_DELAY_MS)
+                            }
+                        } catch (e: FatalRequestException) {
+                            firstError.compareAndSet(null, e.message ?: e.javaClass.simpleName)
+                            throw e
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: CronetException) {
+                            val count = cronetConsecutiveFailures.incrementAndGet()
+                            if (count >= CRONET_FAILURE_THRESHOLD) {
+                                cronetTemporarilyDisabled = true
+                                Log.w(TAG, "Cronet disabled after repeated failures: ${e.message}")
+                            }
+                            firstError.compareAndSet(null, e.message ?: e.javaClass.simpleName)
+                            delay(FAST_RETRY_DELAY_MS)
                         } catch (e: Exception) {
                             firstError.compareAndSet(null, e.message ?: e.javaClass.simpleName)
-                            delay(120)
+                            delay(FAST_RETRY_DELAY_MS)
                         }
                     }
                 }
@@ -500,21 +629,168 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun probeEndpoint(url: String): EndpointInfo {
-        return try {
-            val req = Request.Builder()
-                .url(url)
-                .head()
-                .header("Accept-Encoding", "identity")
-                .build()
-            httpClient.newCall(req).execute().use { resp ->
-                val len = resp.header("Content-Length")?.toLongOrNull() ?: -1L
-                val range = resp.header("Accept-Ranges").orEmpty().contains("bytes", ignoreCase = true)
-                EndpointInfo(contentLength = len, supportsRange = range)
+    private fun nextRangeHeader(supportsRange: Boolean, contentLength: Long, nextRangeStart: AtomicLong): String? {
+        if (!supportsRange || contentLength <= RANGE_CHUNK_SIZE_BYTES) return null
+        val maxStart = (contentLength - RANGE_CHUNK_SIZE_BYTES).coerceAtLeast(0L)
+        val rawStart = nextRangeStart.getAndAdd(RANGE_CHUNK_SIZE_BYTES)
+        val start = rawStart % (maxStart + 1L)
+        val end = (start + RANGE_CHUNK_SIZE_BYTES - 1L).coerceAtMost(contentLength - 1L)
+        return "bytes=$start-$end"
+    }
+
+    private suspend fun ensureCronetEngine(): CronetEngine? {
+        if (cronetEngine != null) return cronetEngine
+        if (cronetReadyAttempted) return null
+        cronetReadyAttempted = true
+
+        val app = getApplication<Application>()
+        val installed = suspendCancellableCoroutine<Boolean> { cont ->
+            CronetProviderInstaller.installProvider(app).addOnCompleteListener { task ->
+                cont.resume(task.isSuccessful)
             }
-        } catch (_: Exception) {
-            EndpointInfo(contentLength = -1L, supportsRange = false)
         }
+        if (!installed) return null
+
+        return try {
+            CronetEngine.Builder(app)
+                .enableHttp2(true)
+                .enableQuic(true)
+                .enableBrotli(true)
+                .build()
+                .also { cronetEngine = it }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private suspend fun downloadWithCronet(
+        engine: CronetEngine,
+        url: String,
+        targetCounter: AtomicLong,
+        targetBytes: Long,
+        onBytesRead: (Long) -> Unit,
+    ): Int = suspendCancellableCoroutine { cont ->
+        val callback = object : UrlRequest.Callback() {
+            private val buffer = ByteBuffer.allocateDirect(READ_BUFFER_SIZE)
+            private var statusCode = 0
+
+            override fun onRedirectReceived(request: UrlRequest, info: UrlResponseInfo, newLocationUrl: String) {
+                request.followRedirect()
+            }
+
+            override fun onResponseStarted(request: UrlRequest, info: UrlResponseInfo) {
+                statusCode = info.httpStatusCode
+                if (statusCode !in 200..299) {
+                    request.cancel()
+                    if (cont.isActive) cont.resume(statusCode)
+                    return
+                }
+                buffer.clear()
+                request.read(buffer)
+            }
+
+            override fun onReadCompleted(request: UrlRequest, info: UrlResponseInfo, byteBuffer: ByteBuffer) {
+                val bytesRead = byteBuffer.position().toLong()
+                if (bytesRead > 0L) {
+                    onBytesRead(bytesRead)
+                }
+                if (!cont.isActive || targetCounter.get() >= targetBytes) {
+                    request.cancel()
+                    if (cont.isActive) cont.resume(statusCode)
+                    return
+                }
+                byteBuffer.clear()
+                request.read(byteBuffer)
+            }
+
+            override fun onSucceeded(request: UrlRequest, info: UrlResponseInfo) {
+                if (cont.isActive) cont.resume(info.httpStatusCode)
+            }
+
+            override fun onFailed(request: UrlRequest, info: UrlResponseInfo?, error: CronetException) {
+                if (cont.isActive) {
+                    cont.resumeWithException(error)
+                }
+            }
+
+            override fun onCanceled(request: UrlRequest, info: UrlResponseInfo?) {
+                if (cont.isActive) cont.resume(statusCode)
+            }
+        }
+
+        try {
+            val builder = engine.newUrlRequestBuilder(url, callback, clientDispatcher.executorService)
+                .setHttpMethod("GET")
+                .addHeader("Accept", "*/*")
+                .addHeader(
+                    "User-Agent",
+                    "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+                )
+                .addHeader("Cache-Control", "no-store")
+                .disableCache()
+            val request = builder.build()
+
+            cont.invokeOnCancellation { request.cancel() }
+            request.start()
+        } catch (e: Exception) {
+            if (cont.isActive) cont.resumeWithException(e)
+        }
+    }
+
+    private fun buildDownloadClient(): OkHttpClient {
+        return OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .retryOnConnectionFailure(true)
+            .protocols(listOf(Protocol.HTTP_1_1))
+            .connectionPool(ConnectionPool(1, 1, TimeUnit.SECONDS))
+            .build()
+    }
+
+    private suspend fun openDownloadStream(url: String, rangeHeader: String?, downloadClient: OkHttpClient): StreamResult {
+        val cronet: CronetEngine? = null
+        if (cronet != null) {
+            try {
+                val connection = withContext(Dispatchers.IO) {
+                    (cronet.openConnection(URL(url)) as HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 10_000
+                        readTimeout = 15_000
+                        instanceFollowRedirects = true
+                        setRequestProperty("Accept", "*/*")
+                        setRequestProperty(
+                            "User-Agent",
+                            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+                        )
+                        setRequestProperty("Cache-Control", "no-store")
+                        if (rangeHeader != null) {
+                            setRequestProperty("Range", rangeHeader)
+                        }
+                        connect()
+                    }
+                }
+                val code = connection.responseCode
+                val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+                return StreamResult(code, stream, connection.contentLengthLong) { connection.disconnect() }
+            } catch (_: Exception) {
+            }
+        }
+
+        val requestBuilder = Request.Builder()
+            .url(url)
+            .get()
+            .cacheControl(CacheControl.Builder().noStore().build())
+            .header("Accept", "*/*")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36",
+            )
+        if (rangeHeader != null) {
+            requestBuilder.header("Range", rangeHeader)
+        }
+        val response = downloadClient.newCall(requestBuilder.build()).execute()
+        val stream = if (response.isSuccessful) response.body?.byteStream() else response.body?.byteStream()
+        return StreamResult(response.code, stream, response.body?.contentLength() ?: -1L) { response.close() }
     }
 
     private fun addConsumedSafely(counter: AtomicLong, target: Long, incoming: Long) {
@@ -580,6 +856,13 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             .getBoolean(PREF_THEME_DARK, false)
     }
 
+    private fun loadThreadCount() {
+        threadCount = getApplication<Application>()
+            .getSharedPreferences(PREFS_NAME, 0)
+            .getInt(PREF_THREAD_COUNT, 8)
+            .coerceIn(1, 64)
+    }
+
     private fun syncKeepAliveService() {
         val app = getApplication<Application>()
         if (keepAliveEnabled && isRunning) {
@@ -592,6 +875,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         super.onCleared()
         TrafficKeepAliveService.stop(getApplication())
+        cronetEngine?.shutdown()
+        cronetEngine = null
     }
 
     class Factory(private val app: Application) : ViewModelProvider.Factory {
@@ -612,26 +897,54 @@ fun TrafficScreen(vm: TrafficViewModel) {
     Column(
         modifier = Modifier
             .fillMaxSize()
-            .padding(12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+            .background(MaterialTheme.colorScheme.background)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Row(
+        Card(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary),
+            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
         ) {
-            Text(text = "网络面板X", style = MaterialTheme.typography.headlineSmall)
-            IconButton(onClick = { vm.toggleTheme() }) {
-                Icon(
-                    painter = painterResource(
-                        id = if (vm.isDarkTheme) R.drawable.ic_theme_light else R.drawable.ic_theme_dark
-                    ),
-                    contentDescription = if (vm.isDarkTheme) "切换到白天主题" else "切换到黑夜主题",
-                    modifier = Modifier.size(24.dp),
-                )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(18.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text(
+                        text = "网络面板X",
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = "批量流量任务 · 实时测速面板",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.82f),
+                    )
+                }
+                IconButton(onClick = { vm.toggleTheme() }) {
+                    Icon(
+                        painter = painterResource(
+                            id = if (vm.isDarkTheme) R.drawable.ic_theme_light else R.drawable.ic_theme_dark
+                        ),
+                        contentDescription = if (vm.isDarkTheme) "切换到白天主题" else "切换到黑夜主题",
+                        modifier = Modifier.size(26.dp),
+                        tint = MaterialTheme.colorScheme.onPrimary,
+                    )
+                }
             }
         }
 
-        TabRow(selectedTabIndex = page) {
+        TabRow(
+            selectedTabIndex = page,
+            containerColor = MaterialTheme.colorScheme.surface,
+            contentColor = MaterialTheme.colorScheme.primary,
+        ) {
             Tab(selected = page == 0, onClick = { page = 0 }, text = { Text("测速") })
             Tab(selected = page == 1, onClick = { page = 1 }, text = { Text("链接管理") })
         }
@@ -644,8 +957,11 @@ fun TrafficScreen(vm: TrafficViewModel) {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 private fun SpeedPanel(vm: TrafficViewModel) {
+    val context = LocalContext.current
+    val qqGroup = "1074735930"
     val progress = if (vm.totalTargetBytes > 0L) {
         (vm.totalConsumedBytes.toFloat() / vm.totalTargetBytes.toFloat()).coerceIn(0f, 1f)
     } else 0f
@@ -653,54 +969,140 @@ private fun SpeedPanel(vm: TrafficViewModel) {
     val remain = (vm.totalTargetBytes - vm.totalConsumedBytes).coerceAtLeast(0L)
     val etaSec = if (vm.currentSpeedBytesPerSec > 0L) remain / vm.currentSpeedBytesPerSec else -1L
 
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Text("状态：${vm.statusText}")
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
+    ) {
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(24.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(14.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Text("运行状态", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            Text(vm.statusText, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.72f))
+                        }
+                        FilterChip(
+                            selected = vm.isRunning,
+                            onClick = {},
+                            label = { Text(if (vm.isRunning) "运行中" else "待开始") },
+                        )
+                    }
 
-        Text("线程数：${vm.threadCount}")
-        Slider(
-            value = vm.threadCount.toFloat(),
-            onValueChange = { vm.updateThreadCount(it.toInt()) },
-            enabled = !vm.isRunning,
-            valueRange = 1f..64f,
-        )
+                    LinearProgressIndicator(
+                        progress = { progress },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(10.dp),
+                    )
 
-        Column(
-            modifier = Modifier.fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-            Text("当前链接：${vm.currentTaskName}")
-            Text("实时网速：${formatBytes(vm.currentSpeedBytesPerSec)}/s")
-            Text("当前链接消耗：${formatBytes(vm.currentTaskConsumed)} / ${formatBytes(vm.currentTaskTarget)}")
-            Text("总流量消耗：${formatBytes(vm.totalConsumedBytes)} / ${formatBytes(vm.totalTargetBytes)}")
-            Text("总进度：${"%.2f".format(progress * 100f)}%")
-            Text("预计剩余：${if (etaSec >= 0L) formatDuration(etaSec) else "-"}")
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        MetricCard("实时网速", "${formatBytes(vm.currentSpeedBytesPerSec)}/s")
+                        MetricCard("总进度", "${"%.2f".format(progress * 100f)}%")
+                        MetricCard("预计剩余", if (etaSec >= 0L) formatDuration(etaSec) else "-")
+                    }
+                }
+            }
         }
 
-        LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("任务详情", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("当前链接：${vm.currentTaskName}")
+                    Text("当前链接消耗：${formatBytes(vm.currentTaskConsumed)} / ${formatBytes(vm.currentTaskTarget)}")
+                    Text("总流量消耗：${formatBytes(vm.totalConsumedBytes)} / ${formatBytes(vm.totalTargetBytes)}")
 
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { vm.start() }, enabled = !vm.isRunning) {
-                Text("开始")
-            }
-            Button(onClick = { vm.stop() }, enabled = vm.isRunning) {
-                Text("停止")
-            }
-            Button(onClick = { vm.toggleKeepAlive() }) {
-                Text(if (vm.keepAliveEnabled) "后台常驻: 开" else "后台常驻: 关")
+                    Text("线程数：${vm.threadCount}", fontWeight = FontWeight.Medium)
+                    Slider(
+                        value = vm.threadCount.toFloat(),
+                        onValueChange = { vm.updateThreadCount(it.toInt()) },
+                        enabled = !vm.isRunning,
+                        valueRange = 1f..64f,
+                    )
+                }
             }
         }
 
-        Text("本测试工具仅提供网络速度自查，请勿用于非法用途，使用本工具造成的一切后果由用户承担！")
-        Spacer(modifier = Modifier.weight(1f))
-        Text("更新QQ群：1074735930", modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
-        Text("版本号：1.0.0", modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center)
+        item {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Button(onClick = { vm.start() }, enabled = !vm.isRunning) {
+                    Text("开始")
+                }
+                Button(onClick = { vm.stop() }, enabled = vm.isRunning) {
+                    Text("停止")
+                }
+                Button(onClick = { vm.toggleKeepAlive() }) {
+                    Text(if (vm.keepAliveEnabled) "后台常驻: 开" else "后台常驻: 关")
+                }
+            }
+        }
+
+        item {
+            Text(
+                "本测试工具仅提供网络速度自查，请勿用于非法用途，使用本工具造成的一切后果由用户承担！",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.66f),
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = "更新QQ群：$qqGroup（点击复制）",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                        val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                        clipboard.setPrimaryClip(ClipData.newPlainText("更新QQ群", qqGroup))
+                        Toast.makeText(context, "QQ群号已复制：$qqGroup", Toast.LENGTH_SHORT).show()
+                    },
+                textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text("版本号：1.0.2", modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
+        }
     }
 }
 
-private data class EndpointInfo(
-    val contentLength: Long,
-    val supportsRange: Boolean,
-)
+@Composable
+private fun MetricCard(label: String, value: String) {
+    Card(
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f))
+            Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        }
+    }
+}
 
 @Composable
 private fun SystemBarsEffect(isDarkTheme: Boolean) {
@@ -709,7 +1111,7 @@ private fun SystemBarsEffect(isDarkTheme: Boolean) {
 
     SideEffect {
         val window = (view.context as Activity).window
-        val color = if (isDarkTheme) android.graphics.Color.parseColor("#121212") else android.graphics.Color.WHITE
+        val color = if (isDarkTheme) android.graphics.Color.parseColor("#0F172A") else android.graphics.Color.parseColor("#F1F5F9")
         window.statusBarColor = color
         window.navigationBarColor = color
         val controller = WindowCompat.getInsetsController(window, view)
@@ -746,12 +1148,17 @@ private fun LinkManagePanel(vm: TrafficViewModel) {
             items(vm.links, key = { item -> item.id }) { item ->
                 val index = vm.links.indexOfFirst { it.id == item.id }
                 val expanded = item.id in expandedIds.value
-                Card(modifier = Modifier.fillMaxWidth()) {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(18.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+                ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -848,6 +1255,23 @@ private fun LinkManagePanel(vm: TrafficViewModel) {
                 Spacer(modifier = Modifier.height(20.dp))
             }
         }
+    }
+}
+
+private class FatalRequestException(message: String) : IllegalStateException(message)
+
+private class StreamResult(
+    val code: Int,
+    val inputStream: InputStream?,
+    val contentLength: Long,
+    private val onClose: () -> Unit,
+) : AutoCloseable {
+    override fun close() {
+        try {
+            inputStream?.close()
+        } catch (_: Exception) {
+        }
+        onClose()
     }
 }
 

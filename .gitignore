@@ -5,6 +5,8 @@ build/
 
 # Local config
 local.properties
+signing-secrets.txt
+app/signing/
 
 # IDE
 .idea/
