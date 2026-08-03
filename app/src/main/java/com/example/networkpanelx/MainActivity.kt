@@ -5,6 +5,8 @@ import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import com.google.android.gms.net.CronetProviderInstaller
 import android.util.Log
@@ -68,6 +70,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.core.view.WindowCompat
 import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
@@ -129,6 +132,22 @@ private const val CRONET_FAILURE_THRESHOLD = 3
 private const val FAST_RETRY_DELAY_MS = 0L
 private const val WORKER_STAGGER_MS = 8L
 private const val QUICK_TRAFFIC_TARGET_GB_TEXT = "0.1"
+private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X/releases/latest"
+
+data class ReleaseInfo(
+    val version: String,
+    val notes: String,
+    val apkDownloadUrl: String?,
+    val releasePageUrl: String,
+)
+
+sealed class UpdateState {
+    data object Idle : UpdateState()
+    data object Checking : UpdateState()
+    data class UpToDate(val latestVersion: String) : UpdateState()
+    data class Available(val release: ReleaseInfo) : UpdateState()
+    data class Error(val message: String) : UpdateState()
+}
 
 data class LinkItem(
     val id: Long,
@@ -154,6 +173,23 @@ private fun isUnlimitedTarget(targetBytes: Long): Boolean = targetBytes <= 0L
 
 private fun hasReachedTarget(consumedBytes: Long, targetBytes: Long): Boolean {
     return !isUnlimitedTarget(targetBytes) && consumedBytes >= targetBytes
+}
+
+private fun compareVersions(left: String, right: String): Int {
+    val leftParts = left.split(Regex("[^0-9]+"))
+        .filter { it.isNotEmpty() }
+        .map { it.toLongOrNull() ?: 0L }
+    val rightParts = right.split(Regex("[^0-9]+"))
+        .filter { it.isNotEmpty() }
+        .map { it.toLongOrNull() ?: 0L }
+    val partCount = max(leftParts.size, rightParts.size)
+
+    for (index in 0 until partCount) {
+        val comparison = (leftParts.getOrElse(index) { 0L })
+            .compareTo(rightParts.getOrElse(index) { 0L })
+        if (comparison != 0) return comparison
+    }
+    return 0
 }
 
 private fun defaultUserAgentOptions(): List<String> = listOf(COMMON_ANDROID_USER_AGENT)
@@ -227,6 +263,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     var isDarkTheme by mutableStateOf(false)
         private set
 
+    var updateState by mutableStateOf<UpdateState>(UpdateState.Idle)
+        private set
+
     var currentTaskName by mutableStateOf("-")
         private set
 
@@ -277,6 +316,65 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             activeThreadCount = threadCount
         }
         persistSettings()
+    }
+
+    fun checkForUpdates() {
+        if (updateState is UpdateState.Checking) return
+
+        updateState = UpdateState.Checking
+        viewModelScope.launch {
+            updateState = withContext(Dispatchers.IO) { fetchLatestRelease() }
+        }
+    }
+
+    private fun fetchLatestRelease(): UpdateState {
+        return try {
+            val request = Request.Builder()
+                .url(LATEST_RELEASE_API_URL)
+                .header("Accept", "application/vnd.github+json")
+                .header("User-Agent", "Network-Panel-X/${BuildConfig.VERSION_NAME}")
+                .cacheControl(CacheControl.Builder().noCache().build())
+                .build()
+
+            httpClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return UpdateState.Error("更新检查失败：服务器返回 ${response.code}")
+                }
+
+                val json = JSONObject(response.body?.string().orEmpty())
+                val tagName = json.optString("tag_name").trim()
+                val latestVersion = tagName.removePrefix("v").trim()
+                val releasePageUrl = json.optString("html_url").trim()
+                if (latestVersion.isEmpty() || releasePageUrl.isEmpty()) {
+                    return UpdateState.Error("更新信息不完整，请稍后重试")
+                }
+
+                if (compareVersions(latestVersion, BuildConfig.VERSION_NAME) <= 0) {
+                    return UpdateState.UpToDate(latestVersion)
+                }
+
+                val assets = json.optJSONArray("assets") ?: JSONArray()
+                val apkUrl = (0 until assets.length())
+                    .asSequence()
+                    .mapNotNull { assets.optJSONObject(it) }
+                    .map { it.optString("browser_download_url").trim() }
+                    .firstOrNull { it.endsWith(".apk", ignoreCase = true) }
+                    ?.ifBlank { null }
+
+                UpdateState.Available(
+                    ReleaseInfo(
+                        version = latestVersion,
+                        notes = json.optString("body").trim(),
+                        apkDownloadUrl = apkUrl,
+                        releasePageUrl = releasePageUrl,
+                    ),
+                )
+            }
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            Log.w(TAG, "Failed to check for updates", error)
+            UpdateState.Error("无法连接更新服务，请检查网络后重试")
+        }
     }
 
     fun updateChunkSizeMb(value: String) {
@@ -1350,10 +1448,96 @@ private fun SpeedPanel(vm: TrafficViewModel) {
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 private fun SettingsPanel(vm: TrafficViewModel) {
+    val context = LocalContext.current
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("在线更新", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "当前版本：${BuildConfig.VERSION_NAME}",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+
+                    when (val state = vm.updateState) {
+                        UpdateState.Idle -> Text(
+                            "从 GitHub Release 检查最新正式包。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                        )
+
+                        UpdateState.Checking -> {
+                            Text("正在检查更新...", style = MaterialTheme.typography.bodySmall)
+                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                        }
+
+                        is UpdateState.UpToDate -> Text(
+                            "已是最新版本（${state.latestVersion}）。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                        )
+
+                        is UpdateState.Available -> {
+                            Text(
+                                "发现新版本：${state.release.version}",
+                                fontWeight = FontWeight.Medium,
+                                color = MaterialTheme.colorScheme.primary,
+                            )
+                            if (state.release.notes.isNotBlank()) {
+                                Text(
+                                    state.release.notes,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    maxLines = 4,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                        }
+
+                        is UpdateState.Error -> Text(
+                            state.message,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Button(
+                            onClick = { vm.checkForUpdates() },
+                            enabled = vm.updateState !is UpdateState.Checking,
+                        ) {
+                            Text("检查更新")
+                        }
+                        val available = vm.updateState as? UpdateState.Available
+                        if (available != null) {
+                            Button(
+                                onClick = {
+                                    openExternalLink(
+                                        context = context,
+                                        url = available.release.apkDownloadUrl ?: available.release.releasePageUrl,
+                                    )
+                                },
+                            ) {
+                                Text(if (available.release.apkDownloadUrl != null) "下载更新" else "查看发行页")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1449,6 +1633,17 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                 }
             }
         }
+    }
+}
+
+private fun openExternalLink(context: Context, url: String) {
+    try {
+        context.startActivity(
+            Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+        )
+    } catch (error: Exception) {
+        Log.w("NetworkPanelX", "Unable to open update URL", error)
+        Toast.makeText(context, "无法打开下载页面", Toast.LENGTH_SHORT).show()
     }
 }
 
