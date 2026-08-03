@@ -74,7 +74,9 @@ jobs:
           echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
 
       - name: Build signed release APK
-        run: ./gradlew --no-daemon assembleRelease
+        run: |
+          chmod +x ./gradlew
+          ./gradlew --no-daemon assembleRelease
 
       - name: Verify APK signatures
         shell: bash
