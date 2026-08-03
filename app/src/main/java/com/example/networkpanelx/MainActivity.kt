@@ -1,17 +1,23 @@
 package com.example.networkpanelx
 
+import android.Manifest
 import android.app.Activity
 import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import com.google.android.gms.net.CronetProviderInstaller
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -51,6 +57,7 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -118,6 +125,9 @@ private const val PREF_THEME_DARK = "theme_dark"
 private const val PREF_THREAD_COUNT = "thread_count"
 private const val PREF_USER_AGENT = "user_agent"
 private const val PREF_USER_AGENT_LIST = "user_agent_list"
+private const val PREF_KEEP_ALIVE = "keep_alive"
+private const val PREF_KEEP_SCREEN_AWAKE = "keep_screen_awake"
+private const val PREF_PROGRESS_NOTIFICATION = "progress_notification"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
 private const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
@@ -250,7 +260,15 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var userAgentOptions by mutableStateOf(defaultUserAgentOptions())
         private set
-    var keepAliveEnabled by mutableStateOf(false)
+    var keepAliveEnabled by mutableStateOf(true)
+        private set
+    var keepScreenAwakeEnabled by mutableStateOf(true)
+        private set
+    var progressNotificationEnabled by mutableStateOf(true)
+        private set
+    var notificationPermissionGranted by mutableStateOf(true)
+        private set
+    var ignoringBatteryOptimizations by mutableStateOf(false)
         private set
     var isDarkTheme by mutableStateOf(false)
         private set
@@ -401,9 +419,30 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         persistSettings()
     }
 
-    fun toggleKeepAlive() {
-        keepAliveEnabled = !keepAliveEnabled
+    fun updateKeepAliveEnabled(enabled: Boolean) {
+        keepAliveEnabled = enabled
+        persistSettings()
         syncKeepAliveService()
+    }
+
+    fun updateKeepScreenAwakeEnabled(enabled: Boolean) {
+        keepScreenAwakeEnabled = enabled
+        persistSettings()
+        syncKeepAliveService()
+    }
+
+    fun updateProgressNotificationEnabled(enabled: Boolean) {
+        progressNotificationEnabled = enabled
+        persistSettings()
+        updateBackgroundNotification()
+    }
+
+    fun refreshBackgroundSystemStatus() {
+        val app = getApplication<Application>()
+        notificationPermissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            app.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+        val powerManager = app.getSystemService(Context.POWER_SERVICE) as PowerManager
+        ignoringBatteryOptimizations = powerManager.isIgnoringBatteryOptimizations(app.packageName)
     }
 
     fun toggleTheme() {
@@ -744,6 +783,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                         currentTaskConsumed = snapshot
                         currentSpeedBytesPerSec = smoothedSpeed
                         updateConsumed(task.id, snapshot)
+                        updateBackgroundNotification()
                     }
 
                     if (hasReachedTarget(snapshot, task.targetBytes)) break
@@ -1093,6 +1133,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             ?: DEFAULT_USER_AGENT
         val userAgentListRaw = runCatching { prefs.getString(PREF_USER_AGENT_LIST, null) }.getOrNull()
         userAgentOptions = loadUserAgentOptions(userAgentListRaw)
+        keepAliveEnabled = prefs.getBoolean(PREF_KEEP_ALIVE, true)
+        keepScreenAwakeEnabled = prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true)
+        progressNotificationEnabled = prefs.getBoolean(PREF_PROGRESS_NOTIFICATION, true)
+        refreshBackgroundSystemStatus()
     }
 
     private fun persistSettings() {
@@ -1102,6 +1146,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             .putInt(PREF_THREAD_COUNT, threadCount)
             .putString(PREF_USER_AGENT, userAgentText)
             .putString(PREF_USER_AGENT_LIST, JSONArray(userAgentOptions).toString())
+            .putBoolean(PREF_KEEP_ALIVE, keepAliveEnabled)
+            .putBoolean(PREF_KEEP_SCREEN_AWAKE, keepScreenAwakeEnabled)
+            .putBoolean(PREF_PROGRESS_NOTIFICATION, progressNotificationEnabled)
             .apply()
     }
 
@@ -1160,10 +1207,31 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private fun syncKeepAliveService() {
         val app = getApplication<Application>()
         if (keepAliveEnabled && isRunning) {
-            TrafficKeepAliveService.start(app)
+            TrafficKeepAliveService.start(
+                context = app,
+                keepScreenAwake = keepScreenAwakeEnabled,
+                showProgress = progressNotificationEnabled,
+                taskName = currentTaskName,
+                consumedBytes = currentTaskConsumed,
+                targetBytes = currentTaskTarget,
+                speedBytesPerSec = currentSpeedBytesPerSec,
+            )
         } else {
             TrafficKeepAliveService.stop(app)
         }
+    }
+
+    private fun updateBackgroundNotification() {
+        if (!keepAliveEnabled || !isRunning) return
+        TrafficKeepAliveService.update(
+            context = getApplication(),
+            keepScreenAwake = keepScreenAwakeEnabled,
+            showProgress = progressNotificationEnabled,
+            taskName = currentTaskName,
+            consumedBytes = currentTaskConsumed,
+            targetBytes = currentTaskTarget,
+            speedBytesPerSec = currentSpeedBytesPerSec,
+        )
     }
 
     override fun onCleared() {
@@ -1353,9 +1421,6 @@ private fun SpeedPanel(vm: TrafficViewModel) {
                 Button(onClick = { vm.stop() }, enabled = vm.isRunning) {
                     Text("停止")
                 }
-                Button(onClick = { vm.toggleKeepAlive() }) {
-                    Text(if (vm.keepAliveEnabled) "后台常驻: 开" else "后台常驻: 关")
-                }
             }
         }
 
@@ -1393,6 +1458,17 @@ private fun SpeedPanel(vm: TrafficViewModel) {
 @Composable
 private fun SettingsPanel(vm: TrafficViewModel) {
     val context = LocalContext.current
+    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { vm.refreshBackgroundSystemStatus() }
+    val batteryOptimizationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult(),
+    ) { vm.refreshBackgroundSystemStatus() }
+
+    LaunchedEffect(Unit) {
+        vm.refreshBackgroundSystemStatus()
+    }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -1407,122 +1483,9 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                     modifier = Modifier.padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Text("在线更新", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "当前版本：${BuildConfig.VERSION_NAME}",
-                        style = MaterialTheme.typography.bodyMedium,
-                    )
-
-                    when (val state = vm.updateState) {
-                        UpdateState.Idle -> Text(
-                            "从 GitHub Release 检查最新正式包。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
-                        )
-
-                        UpdateState.Checking -> {
-                            Text("正在检查更新...", style = MaterialTheme.typography.bodySmall)
-                            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                        }
-
-                        is UpdateState.UpToDate -> Text(
-                            "已是最新版本（${state.latestVersion}）。",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
-                        )
-
-                        is UpdateState.Available -> {
-                            Text(
-                                "发现新版本：${state.release.version}",
-                                fontWeight = FontWeight.Medium,
-                                color = MaterialTheme.colorScheme.primary,
-                            )
-                            if (state.release.notes.isNotBlank()) {
-                                Text(
-                                    state.release.notes,
-                                    style = MaterialTheme.typography.bodySmall,
-                                    maxLines = 4,
-                                    overflow = TextOverflow.Ellipsis,
-                                )
-                            }
-                        }
-
-                        is UpdateState.Error -> Text(
-                            state.message,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
-                        )
-                    }
-
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
-                    ) {
-                        Button(
-                            onClick = { vm.checkForUpdates() },
-                            enabled = vm.updateState !is UpdateState.Checking,
-                        ) {
-                            Text("检查更新")
-                        }
-                        val available = vm.updateState as? UpdateState.Available
-                        if (available != null) {
-                            Button(
-                                onClick = {
-                                    openExternalLink(
-                                        context = context,
-                                        url = available.release.apkDownloadUrl ?: available.release.releasePageUrl,
-                                    )
-                                },
-                            ) {
-                                Text(if (available.release.apkDownloadUrl != null) "下载更新" else "查看发行页")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    Text("测速设置", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-
-                    Text(
-                        "自适应分片已默认开启：小文件使用较小分片，大文件自动增大分片；线程上限仅会为小文件收敛，避免浪费连接。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
-                    )
-
-                    Text("线程数上限：${vm.threadCount}，当前活跃：${vm.activeThreadCount}", fontWeight = FontWeight.Medium)
-                    Slider(
-                        value = vm.threadCount.toFloat(),
-                        onValueChange = { vm.updateThreadCount(it.toInt()) },
-                        valueRange = 1f..64f,
-                    )
-                }
-            }
-        }
-
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
                     Text("请求 UA", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "全局 UA 默认使用 Android Chrome。链接留空时继承这里的值，也可以单独填写专用 UA。",
+                        "全局 UA 默认使用 Android Chrome。链接留空时继承这里的值，也可以从已保存的 UA 快速选择。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
                     )
@@ -1554,6 +1517,226 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                         Button(onClick = { vm.clearGlobalUserAgent() }) {
                             Text("不使用 UA")
                         }
+                    }
+                }
+            }
+        }
+
+        item {
+            BackgroundSettingsPanel(
+                vm = vm,
+                onRequestNotificationPermission = {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } else {
+                        vm.refreshBackgroundSystemStatus()
+                    }
+                },
+                onRequestBatteryExemption = {
+                    try {
+                        batteryOptimizationLauncher.launch(
+                            Intent(
+                                android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                Uri.parse("package:${context.packageName}"),
+                            ),
+                        )
+                    } catch (_: Exception) {
+                        Toast.makeText(context, "无法打开电池优化设置", Toast.LENGTH_SHORT).show()
+                    }
+                },
+            )
+        }
+
+        item {
+            UpdatePanel(vm = vm, context = context)
+        }
+    }
+}
+
+@Composable
+private fun BackgroundSettingsPanel(
+    vm: TrafficViewModel,
+    onRequestNotificationPermission: () -> Unit,
+    onRequestBatteryExemption: () -> Unit,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("后台运行", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                "启用后，测速会使用前台服务在后台持续运行。Android 要求前台服务保留系统通知。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+            )
+
+            BackgroundSettingRow(
+                title = "后台常驻",
+                description = "测速时启动前台服务，降低被系统回收的概率。",
+                checked = vm.keepAliveEnabled,
+                onCheckedChange = vm::updateKeepAliveEnabled,
+            )
+            BackgroundSettingRow(
+                title = "熄屏继续运行",
+                description = "使用唤醒锁保持 CPU 和网络任务；会增加耗电。",
+                checked = vm.keepScreenAwakeEnabled,
+                onCheckedChange = vm::updateKeepScreenAwakeEnabled,
+                enabled = vm.keepAliveEnabled,
+            )
+            BackgroundSettingRow(
+                title = "状态栏进度通知",
+                description = "显示当前链接、网速与进度；关闭后仍会保留 Android 必需的后台服务通知。",
+                checked = vm.progressNotificationEnabled,
+                onCheckedChange = vm::updateProgressNotificationEnabled,
+                enabled = vm.keepAliveEnabled,
+            )
+
+            Text(
+                if (vm.notificationPermissionGranted) "通知权限：已允许" else "通知权限：未允许，Android 13 及以上系统可能不在通知栏展示进度。",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (vm.notificationPermissionGranted) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f)
+                } else {
+                    MaterialTheme.colorScheme.error
+                },
+            )
+            if (!vm.notificationPermissionGranted) {
+                Button(onClick = onRequestNotificationPermission) {
+                    Text("授权通知")
+                }
+            }
+
+            Text(
+                if (vm.ignoringBatteryOptimizations) "电池优化：已忽略" else "电池优化：建议忽略，避免熄屏后被系统限制。",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (vm.ignoringBatteryOptimizations) {
+                    MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f)
+                } else {
+                    MaterialTheme.colorScheme.error
+                },
+            )
+            if (!vm.ignoringBatteryOptimizations) {
+                Button(onClick = onRequestBatteryExemption) {
+                    Text("忽略电池优化")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun BackgroundSettingRow(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Checkbox(
+            checked = checked,
+            onCheckedChange = onCheckedChange,
+            enabled = enabled,
+        )
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title)
+            Text(
+                description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun UpdatePanel(vm: TrafficViewModel, context: Context) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("在线更新", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                "当前版本：${BuildConfig.VERSION_NAME}",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+
+            when (val state = vm.updateState) {
+                UpdateState.Idle -> Text(
+                    "从 GitHub Release 检查最新正式包。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                )
+
+                UpdateState.Checking -> {
+                    Text("正在检查更新...", style = MaterialTheme.typography.bodySmall)
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+
+                is UpdateState.UpToDate -> Text(
+                    "已是最新版本（${state.latestVersion}）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                )
+
+                is UpdateState.Available -> {
+                    Text(
+                        "发现新版本：${state.release.version}",
+                        fontWeight = FontWeight.Medium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    if (state.release.notes.isNotBlank()) {
+                        Text(
+                            state.release.notes,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 4,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+
+                is UpdateState.Error -> Text(
+                    state.message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                Button(
+                    onClick = { vm.checkForUpdates() },
+                    enabled = vm.updateState !is UpdateState.Checking,
+                ) {
+                    Text("检查更新")
+                }
+                val available = vm.updateState as? UpdateState.Available
+                if (available != null) {
+                    Button(
+                        onClick = {
+                            openExternalLink(
+                                context = context,
+                                url = available.release.apkDownloadUrl ?: available.release.releasePageUrl,
+                            )
+                        },
+                    ) {
+                        Text(if (available.release.apkDownloadUrl != null) "下载更新" else "查看发行页")
                     }
                 }
             }
@@ -1814,24 +1997,6 @@ private fun LinkManagePanel(
                                 emptyLabel = "使用全局 UA",
                                 enabled = !vm.isRunning,
                                 onValueSelected = { vm.updateLinkUserAgent(item.id, it) },
-                            )
-
-                            OutlinedTextField(
-                                value = item.userAgent,
-                                onValueChange = { vm.updateLinkUserAgent(item.id, it) },
-                                modifier = Modifier.fillMaxWidth(),
-                                label = { Text("链接专用 User-Agent") },
-                                supportingText = {
-                                    Text(
-                                        if (item.userAgent.isBlank()) {
-                                            "当前继承全局 UA：${userAgentLabel(vm.userAgentText).ifBlank { "空 UA" }}"
-                                        } else {
-                                            "填写或修改后仅对这个链接生效。"
-                                        },
-                                    )
-                                },
-                                enabled = !vm.isRunning,
-                                minLines = 2,
                             )
                         }
 
