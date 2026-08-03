@@ -1337,7 +1337,12 @@ private fun SpeedPanel(vm: TrafficViewModel) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.primary,
             )
-            Text("版本号：1.0.4", modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center, style = MaterialTheme.typography.bodySmall)
+            Text(
+                "版本号：${BuildConfig.VERSION_NAME}",
+                modifier = Modifier.fillMaxWidth(),
+                textAlign = TextAlign.Center,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }
