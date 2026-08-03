@@ -116,17 +116,15 @@ private const val PREFS_NAME = "traffic_prefs"
 private const val PREF_LINKS = "links_json"
 private const val PREF_THEME_DARK = "theme_dark"
 private const val PREF_THREAD_COUNT = "thread_count"
-private const val PREF_CHUNK_SIZE_MB = "chunk_size_mb"
-private const val PREF_DYNAMIC_TUNING = "dynamic_tuning"
 private const val PREF_USER_AGENT = "user_agent"
 private const val PREF_USER_AGENT_LIST = "user_agent_list"
-private const val DEFAULT_USER_AGENT = ""
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
-private const val DEFAULT_CHUNK_SIZE_MB = 32.0
-private const val MIN_CHUNK_SIZE_MB = 0.05
-private const val MAX_CHUNK_SIZE_MB = 256.0
+private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
 private const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
 private const val READ_BUFFER_SIZE = 1024 * 1024
+private const val DEFAULT_ADAPTIVE_CHUNK_SIZE_BYTES = 2L * 1024L * 1024L
+private const val MIN_ADAPTIVE_CHUNK_SIZE_BYTES = 128L * 1024L
+private const val MAX_ADAPTIVE_CHUNK_SIZE_BYTES = 32L * 1024L * 1024L
 private const val MAX_EFFECTIVE_CONCURRENCY = 64
 private const val CRONET_FAILURE_THRESHOLD = 3
 private const val FAST_RETRY_DELAY_MS = 0L
@@ -248,12 +246,6 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var activeThreadCount by mutableIntStateOf(8)
         private set
-    var chunkSizeMbText by mutableStateOf(DEFAULT_CHUNK_SIZE_MB.toString().trimEnd('0').trimEnd('.'))
-        private set
-    var activeChunkSizeBytes by mutableLongStateOf((DEFAULT_CHUNK_SIZE_MB * 1024.0 * 1024.0).toLong())
-        private set
-    var dynamicTuningEnabled by mutableStateOf(false)
-        private set
     var userAgentText by mutableStateOf(DEFAULT_USER_AGENT)
         private set
     var userAgentOptions by mutableStateOf(defaultUserAgentOptions())
@@ -289,6 +281,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private var activeRunTargets: Map<Long, Long> = emptyMap()
     private val cronetConsecutiveFailures = AtomicLong(0L)
     private var cronetTemporarilyDisabled = false
+    private val activeRangeChunkSizeBytes = AtomicLong(DEFAULT_ADAPTIVE_CHUNK_SIZE_BYTES)
     private val clientDispatcher = Dispatcher().apply {
         maxRequests = 128
         maxRequestsPerHost = 128
@@ -312,7 +305,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateThreadCount(value: Int) {
         threadCount = value.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
-        if (!dynamicTuningEnabled || !isRunning) {
+        if (!isRunning) {
             activeThreadCount = threadCount
         }
         persistSettings()
@@ -375,27 +368,6 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             Log.w(TAG, "Failed to check for updates", error)
             UpdateState.Error("无法连接更新服务，请检查网络后重试")
         }
-    }
-
-    fun updateChunkSizeMb(value: String) {
-        val sanitized = value.filter { it.isDigit() || it == '.' }
-            .let { raw ->
-                val firstDot = raw.indexOf('.')
-                if (firstDot < 0) raw else raw.take(firstDot + 1) + raw.drop(firstDot + 1).replace(".", "")
-            }
-            .take(6)
-        chunkSizeMbText = sanitized
-        activeChunkSizeBytes = configuredChunkSizeBytes()
-        persistSettings()
-    }
-
-    fun toggleDynamicTuning() {
-        dynamicTuningEnabled = !dynamicTuningEnabled
-        if (!dynamicTuningEnabled || !isRunning) {
-            activeThreadCount = threadCount
-            activeChunkSizeBytes = configuredChunkSizeBytes()
-        }
-        persistSettings()
     }
 
     fun updateUserAgent(value: String) {
@@ -594,7 +566,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         totalTargetBytes = if (parsed.any { isUnlimitedTarget(it.targetBytes) }) 0L else parsed.sumOf { it.targetBytes }
         totalConsumedBytes = parsed.sumOf { if (isUnlimitedTarget(it.targetBytes)) it.initialConsumedBytes else minOf(it.initialConsumedBytes, it.targetBytes) }
         activeThreadCount = threadCount
-        activeChunkSizeBytes = configuredChunkSizeBytes()
+        activeRangeChunkSizeBytes.set(DEFAULT_ADAPTIVE_CHUNK_SIZE_BYTES)
         currentTaskName = "-"
         currentTaskConsumed = 0L
         currentTaskTarget = 0L
@@ -700,7 +672,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun probeRangeSupport(url: String, userAgent: String?): Pair<Boolean, Long> = withContext(Dispatchers.IO) {
-        val minRangeSize = if (dynamicTuningEnabled) 32L * 1024L else currentRangeChunkSizeBytes()
+        val minRangeSize = MIN_ADAPTIVE_CHUNK_SIZE_BYTES
         try {
             val requestBuilder = Request.Builder()
                 .url(url)
@@ -748,9 +720,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         val lastProgressAt = AtomicLong(System.currentTimeMillis())
         val firstError = AtomicReference<String?>(null)
         val (supportsRange, contentLength) = probeRangeSupport(task.url, task.userAgent)
-        if (dynamicTuningEnabled && contentLength > 0L) {
-            activeChunkSizeBytes = chooseChunkSizeForContent(contentLength, 0L)
-        }
+        activeRangeChunkSizeBytes.set(chooseChunkSizeForContent(contentLength, 0L))
         val nextRangeStart = AtomicLong(0L)
 
         coroutineScope {
@@ -1118,12 +1088,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
         threadCount = prefs.getInt(PREF_THREAD_COUNT, 8).coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
         activeThreadCount = threadCount
-        chunkSizeMbText = loadChunkSizeMbText(prefs)
-        activeChunkSizeBytes = configuredChunkSizeBytes()
-        dynamicTuningEnabled = prefs.getBoolean(PREF_DYNAMIC_TUNING, false)
         userAgentText = runCatching { prefs.getString(PREF_USER_AGENT, DEFAULT_USER_AGENT) }
             .getOrNull()
-            .orEmpty()
+            ?: DEFAULT_USER_AGENT
         val userAgentListRaw = runCatching { prefs.getString(PREF_USER_AGENT_LIST, null) }.getOrNull()
         userAgentOptions = loadUserAgentOptions(userAgentListRaw)
     }
@@ -1133,8 +1100,6 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             .getSharedPreferences(PREFS_NAME, 0)
             .edit()
             .putInt(PREF_THREAD_COUNT, threadCount)
-            .putString(PREF_CHUNK_SIZE_MB, normalizedChunkSizeText())
-            .putBoolean(PREF_DYNAMIC_TUNING, dynamicTuningEnabled)
             .putString(PREF_USER_AGENT, userAgentText)
             .putString(PREF_USER_AGENT_LIST, JSONArray(userAgentOptions).toString())
             .apply()
@@ -1142,13 +1107,6 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun resolveTaskUserAgent(item: LinkItem): String? {
         return item.userAgent.trim().ifEmpty { userAgentText.trim() }.ifEmpty { null }
-    }
-
-    private fun loadChunkSizeMbText(prefs: android.content.SharedPreferences): String {
-        return runCatching { prefs.getString(PREF_CHUNK_SIZE_MB, null) }
-            .getOrNull()
-            ?: runCatching { prefs.getInt(PREF_CHUNK_SIZE_MB, DEFAULT_CHUNK_SIZE_MB.toInt()).toString() }
-                .getOrDefault(DEFAULT_CHUNK_SIZE_MB.toString())
     }
 
     private fun loadUserAgentOptions(raw: String?): List<String> {
@@ -1164,50 +1122,37 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }.getOrDefault(defaultUserAgentOptions()).ifEmpty { defaultUserAgentOptions() }
     }
 
-    private fun normalizedChunkSizeText(): String {
-        return (chunkSizeMbText.toDoubleOrNull()?.coerceIn(MIN_CHUNK_SIZE_MB, MAX_CHUNK_SIZE_MB) ?: DEFAULT_CHUNK_SIZE_MB)
-            .let { value -> if (value % 1.0 == 0.0) value.toInt().toString() else "%.2f".format(value).trimEnd('0').trimEnd('.') }
-    }
-
-    private fun configuredChunkSizeBytes(): Long {
-        val mb = chunkSizeMbText.toDoubleOrNull()?.coerceIn(MIN_CHUNK_SIZE_MB, MAX_CHUNK_SIZE_MB) ?: DEFAULT_CHUNK_SIZE_MB
-        return (mb * 1024.0 * 1024.0).toLong().coerceAtLeast(32L * 1024L)
-    }
-
-    private fun currentRangeChunkSizeBytes(): Long = activeChunkSizeBytes.coerceAtLeast(32L * 1024L)
+    private fun currentRangeChunkSizeBytes(): Long = activeRangeChunkSizeBytes.get()
+        .coerceIn(MIN_ADAPTIVE_CHUNK_SIZE_BYTES, MAX_ADAPTIVE_CHUNK_SIZE_BYTES)
 
     private fun chooseChunkSizeForContent(contentLength: Long, speedBytesPerSec: Long): Long {
-        if (!dynamicTuningEnabled) return configuredChunkSizeBytes()
-        val chunk = when {
-            contentLength in 1..(512L * 1024L) -> 64L * 1024L
-            contentLength <= 2L * 1024L * 1024L -> 128L * 1024L
-            contentLength <= 10L * 1024L * 1024L -> 512L * 1024L
-            contentLength <= 50L * 1024L * 1024L -> 1L * 1024L * 1024L
-            contentLength <= 200L * 1024L * 1024L -> 4L * 1024L * 1024L
-            contentLength <= 1024L * 1024L * 1024L -> 8L * 1024L * 1024L
-            speedBytesPerSec > 200L * 1024L * 1024L -> 64L * 1024L * 1024L
-            speedBytesPerSec > 80L * 1024L * 1024L -> 32L * 1024L * 1024L
-            else -> 16L * 1024L * 1024L
+        val baseChunk = when {
+            contentLength in 1..(2L * 1024L * 1024L) -> 128L * 1024L
+            contentLength in 1..(16L * 1024L * 1024L) -> 512L * 1024L
+            contentLength in 1..(128L * 1024L * 1024L) -> 2L * 1024L * 1024L
+            contentLength in 1..(1024L * 1024L * 1024L) -> 4L * 1024L * 1024L
+            contentLength in 1..(4L * 1024L * 1024L * 1024L) -> 8L * 1024L * 1024L
+            contentLength > 0L -> 16L * 1024L * 1024L
+            else -> DEFAULT_ADAPTIVE_CHUNK_SIZE_BYTES
         }
-        return chunk.coerceIn(32L * 1024L, (MAX_CHUNK_SIZE_MB * 1024.0 * 1024.0).toLong())
+        val speedAdjustedChunk = when {
+            speedBytesPerSec >= 160L * 1024L * 1024L -> max(baseChunk, 32L * 1024L * 1024L)
+            speedBytesPerSec >= 60L * 1024L * 1024L -> max(baseChunk, 16L * 1024L * 1024L)
+            else -> baseChunk
+        }
+        return speedAdjustedChunk.coerceIn(MIN_ADAPTIVE_CHUNK_SIZE_BYTES, MAX_ADAPTIVE_CHUNK_SIZE_BYTES)
     }
 
     private fun computeActiveThreadCount(speedBytesPerSec: Long, contentLength: Long): Int {
         val configuredThreads = threadCount.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
-        val desired = if (!dynamicTuningEnabled) {
-            configuredThreads
-        } else {
-            when {
-                contentLength in 1..(512L * 1024L) -> minOf(configuredThreads, 4)
-                contentLength <= 2L * 1024L * 1024L -> minOf(configuredThreads, 6)
-                speedBytesPerSec < 5L * 1024L * 1024L -> minOf(configuredThreads, 4)
-                speedBytesPerSec < 20L * 1024L * 1024L -> minOf(configuredThreads, 8)
-                speedBytesPerSec < 80L * 1024L * 1024L -> minOf(configuredThreads, 16)
-                else -> configuredThreads
-            }.coerceAtLeast(1)
+        val desired = when {
+            contentLength in 1..(2L * 1024L * 1024L) -> minOf(configuredThreads, 4)
+            contentLength in 1..(16L * 1024L * 1024L) -> minOf(configuredThreads, 8)
+            contentLength in 1..(128L * 1024L * 1024L) -> minOf(configuredThreads, 16)
+            else -> configuredThreads
         }
         activeThreadCount = desired
-        activeChunkSizeBytes = chooseChunkSizeForContent(contentLength, speedBytesPerSec)
+        activeRangeChunkSizeBytes.set(chooseChunkSizeForContent(contentLength, speedBytesPerSec))
         return desired
     }
 
@@ -1386,7 +1331,6 @@ private fun SpeedPanel(vm: TrafficViewModel) {
                     Text("当前链接消耗：${formatBytes(vm.currentTaskConsumed)} / ${formatTargetBytes(vm.currentTaskTarget)}")
                     Text("总流量消耗：${formatBytes(vm.totalConsumedBytes)} / ${formatTargetBytes(vm.totalTargetBytes)}")
                     Text("活跃线程：${vm.activeThreadCount} / ${vm.threadCount}")
-                    Text("当前分片：${formatBytes(vm.activeChunkSizeBytes)}")
                     Text("线程数上限：${vm.threadCount}", fontWeight = FontWeight.Medium)
                     Slider(
                         value = vm.threadCount.toFloat(),
@@ -1550,36 +1494,17 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                 ) {
                     Text("测速设置", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
 
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Checkbox(
-                            checked = vm.dynamicTuningEnabled,
-                            onCheckedChange = { vm.toggleDynamicTuning() },
-                        )
-                        Column {
-                            Text("动态调优分片和线程")
-                            Text(
-                                "开启后优先按链接文件大小自动切分：小图片会使用 64KB/128KB 等小分片，大文件再逐步放大分片，并在上限内调整活跃线程。",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
-                            )
-                        }
-                    }
+                    Text(
+                        "自适应分片已默认开启：小文件使用较小分片，大文件自动增大分片；线程上限仅会为小文件收敛，避免浪费连接。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                    )
 
                     Text("线程数上限：${vm.threadCount}，当前活跃：${vm.activeThreadCount}", fontWeight = FontWeight.Medium)
                     Slider(
                         value = vm.threadCount.toFloat(),
                         onValueChange = { vm.updateThreadCount(it.toInt()) },
                         valueRange = 1f..64f,
-                    )
-
-                    OutlinedTextField(
-                        value = vm.chunkSizeMbText,
-                        onValueChange = { vm.updateChunkSizeMb(it) },
-                        modifier = Modifier.fillMaxWidth(),
-                        label = { Text("固定分片大小 (MB)") },
-                        supportingText = { Text("关闭动态调优时使用；支持小数，例如 0.1MB。范围 0.05-256MB。当前：${formatBytes(vm.activeChunkSizeBytes)}") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
                     )
                 }
             }
@@ -1597,12 +1522,12 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                 ) {
                     Text("请求 UA", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "这里是全局 UA。留空时会发送空 UA；链接管理里单独选择 UA 后，会覆盖全局 UA。",
+                        "全局 UA 默认使用 Android Chrome。链接留空时继承这里的值，也可以单独填写专用 UA。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
                     )
                     UserAgentDropdown(
-                        label = "从已保存 UA 选择",
+                        label = "已保存的 UA",
                         value = vm.userAgentText,
                         options = vm.userAgentOptions,
                         emptyLabel = "空 UA（不使用默认 UA）",
@@ -1612,22 +1537,22 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                         value = vm.userAgentText,
                         onValueChange = { vm.updateUserAgent(it) },
                         modifier = Modifier.fillMaxWidth(),
-                        label = { Text("全局 User-Agent") },
+                        label = { Text("自定义全局 User-Agent") },
                         minLines = 2,
-                        supportingText = { Text("编辑后可点击保存到下拉列表，方便后续切换。") },
+                        supportingText = { Text("保存后可以在任一链接快速选用。") },
                     )
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
                         Button(onClick = { vm.saveCurrentUserAgentToList() }, enabled = vm.userAgentText.isNotBlank()) {
-                            Text("保存 UA")
+                            Text("保存到列表")
                         }
                         Button(onClick = { vm.removeCurrentUserAgentFromList() }, enabled = vm.userAgentText.isNotBlank()) {
-                            Text("删除此 UA")
+                            Text("从列表移除")
                         }
                         Button(onClick = { vm.clearGlobalUserAgent() }) {
-                            Text("清空 UA")
+                            Text("不使用 UA")
                         }
                     }
                 }
@@ -1647,6 +1572,16 @@ private fun openExternalLink(context: Context, url: String) {
     }
 }
 
+private fun userAgentLabel(value: String): String {
+    val normalized = value.trim()
+    return when {
+        normalized.isEmpty() -> ""
+        normalized == COMMON_ANDROID_USER_AGENT -> "Android Chrome（推荐）"
+        normalized.length <= 42 -> normalized
+        else -> "${normalized.take(42)}..."
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun UserAgentDropdown(
@@ -1663,7 +1598,7 @@ private fun UserAgentDropdown(
         onExpandedChange = { if (enabled) expanded = !expanded },
     ) {
         OutlinedTextField(
-            value = value.ifBlank { emptyLabel },
+            value = value.ifBlank { emptyLabel }.let(::userAgentLabel).ifBlank { emptyLabel },
             onValueChange = {},
             modifier = Modifier
                 .menuAnchor()
@@ -1686,7 +1621,7 @@ private fun UserAgentDropdown(
             )
             options.forEach { option ->
                 DropdownMenuItem(
-                    text = { Text(option) },
+                    text = { Text(userAgentLabel(option), maxLines = 1, overflow = TextOverflow.Ellipsis) },
                     onClick = {
                         onValueSelected(option)
                         expanded = false
@@ -1763,6 +1698,9 @@ private fun LinkManagePanel(
                         enabled = !vm.isRunning && vm.links.any { it.enabled },
                     ) {
                         Text("一键测流")
+                    }
+                    Button(onClick = { vm.stop() }, enabled = vm.isRunning) {
+                        Text("一键暂停")
                     }
                 }
                 Text("已勾选：${vm.links.count { it.enabled }} / ${vm.links.size}，一键测流每条 0.1GB")
@@ -1870,12 +1808,30 @@ private fun LinkManagePanel(
                             )
 
                             UserAgentDropdown(
-                                label = "该链接 UA（空=使用全局 UA）",
+                                label = "从保存的 UA 选择",
                                 value = item.userAgent,
                                 options = vm.userAgentOptions,
                                 emptyLabel = "使用全局 UA",
                                 enabled = !vm.isRunning,
                                 onValueSelected = { vm.updateLinkUserAgent(item.id, it) },
+                            )
+
+                            OutlinedTextField(
+                                value = item.userAgent,
+                                onValueChange = { vm.updateLinkUserAgent(item.id, it) },
+                                modifier = Modifier.fillMaxWidth(),
+                                label = { Text("链接专用 User-Agent") },
+                                supportingText = {
+                                    Text(
+                                        if (item.userAgent.isBlank()) {
+                                            "当前继承全局 UA：${userAgentLabel(vm.userAgentText).ifBlank { "空 UA" }}"
+                                        } else {
+                                            "填写或修改后仅对这个链接生效。"
+                                        },
+                                    )
+                                },
+                                enabled = !vm.isRunning,
+                                minLines = 2,
                             )
                         }
 
@@ -1936,9 +1892,9 @@ private fun formatDuration(totalSec: Long): String {
     val m = (totalSec % 3600) / 60
     val s = totalSec % 60
     return if (h > 0) {
-        String.format("%d小时%02d分%02d秒", h, m, s)
+        String.format("%dh %02dm %02ds", h, m, s)
     } else {
-        String.format("%02d分%02d秒", m, s)
+        String.format("%02dm %02ds", m, s)
     }
 }
 
