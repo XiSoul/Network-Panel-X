@@ -76,6 +76,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.core.view.WindowCompat
@@ -111,6 +112,7 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
+import java.time.LocalDate
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
@@ -127,6 +129,9 @@ private const val PREF_USER_AGENT_LIST = "user_agent_list"
 private const val PREF_KEEP_ALIVE = "keep_alive"
 private const val PREF_KEEP_SCREEN_AWAKE = "keep_screen_awake"
 private const val PREF_PROGRESS_NOTIFICATION = "progress_notification"
+private const val PREF_DAILY_TRAFFIC_DATE = "daily_traffic_date"
+private const val PREF_DAILY_TRAFFIC_BYTES = "daily_traffic_bytes"
+private const val PREF_DAILY_TASK_COUNT = "daily_task_count"
 private const val LEGACY_ANDROID_APP_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; Network-Panel-X Build/UP1A.231005.007)"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
@@ -334,6 +339,23 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     var updateState by mutableStateOf<UpdateState>(UpdateState.Idle)
         private set
 
+    private val cloudSessionStore = CloudSessionStore(app)
+    private var cloudSession: CloudSession? = cloudSessionStore.load()
+    var cloudUsername by mutableStateOf(cloudSession?.username.orEmpty())
+        private set
+    var cloudStatus by mutableStateOf(if (cloudSession != null) "已登录" else "未登录")
+        private set
+    var dailyTrafficBytes by mutableLongStateOf(0L)
+        private set
+    var dailyTaskCount by mutableIntStateOf(0)
+        private set
+    var personalStats by mutableStateOf<CloudTrafficStats?>(null)
+        private set
+    var leaderboardEntries by mutableStateOf(emptyList<LeaderboardEntry>())
+        private set
+    var statsLoading by mutableStateOf(false)
+        private set
+
     var currentTaskName by mutableStateOf("-")
         private set
 
@@ -376,6 +398,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         loadLinks()
         loadTheme()
         loadSettings()
+        loadDailyTraffic()
         nextId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
         TrafficNotificationCommandBus.register(this)
         if (keepAliveEnabled) syncKeepAliveService()
@@ -395,6 +418,55 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         updateState = UpdateState.Checking
         viewModelScope.launch {
             updateState = withContext(Dispatchers.IO) { fetchLatestRelease() }
+        }
+    }
+
+    fun registerCloudAccount(apiBaseUrl: String, username: String, password: String) = authenticateCloudAccount {
+        CloudApi.register(apiBaseUrl, username, password)
+    }
+
+    fun loginCloudAccount(apiBaseUrl: String, username: String, password: String) = authenticateCloudAccount {
+        CloudApi.login(apiBaseUrl, username, password)
+    }
+
+    fun logoutCloudAccount() {
+        cloudSessionStore.clear()
+        cloudSession = null
+        cloudUsername = ""
+        cloudStatus = "未登录"
+        personalStats = null
+        leaderboardEntries = emptyList()
+    }
+
+    fun refreshCloudStats(period: String) {
+        val session = cloudSession ?: run {
+            cloudStatus = "请先登录云端账号"
+            return
+        }
+        statsLoading = true
+        viewModelScope.launch {
+            runCatching {
+                CloudApi.syncTraffic(session, dailyTrafficBytes, dailyTaskCount.toLong())
+                CloudApi.personalStats(session, period) to CloudApi.leaderboard(session, period)
+            }.onSuccess { (stats, entries) ->
+                personalStats = stats
+                leaderboardEntries = entries
+                cloudStatus = "已同步${stats.period}统计"
+            }.onFailure { cloudStatus = it.message ?: "云端统计读取失败" }
+            statsLoading = false
+        }
+    }
+
+    private fun authenticateCloudAccount(action: suspend () -> CloudSession) {
+        viewModelScope.launch {
+            cloudStatus = "正在校验账号..."
+            runCatching { action() }.onSuccess { session ->
+                cloudSessionStore.save(session)
+                cloudSession = session
+                cloudUsername = session.username
+                cloudStatus = "登录成功"
+                refreshCloudStats("day")
+            }.onFailure { cloudStatus = it.message ?: "登录失败" }
         }
     }
 
@@ -688,6 +760,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         isRunning = true
+        addDailyTaskCount(parsed.size)
         statusText = initialStatusText
         syncKeepAliveService()
 
@@ -1136,6 +1209,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun updateConsumed(taskId: Long, taskConsumed: Long) {
+        val previousTotal = totalConsumedBytes
         links = links.map {
             if (it.id == taskId) it.copy(consumedBytes = taskConsumed) else it
         }
@@ -1143,6 +1217,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             val target = activeRunTargets[item.id] ?: return@sumOf 0L
             if (isUnlimitedTarget(target)) item.consumedBytes else minOf(item.consumedBytes, target)
         }
+        addDailyTraffic((totalConsumedBytes - previousTotal).coerceAtLeast(0L))
     }
 
     private fun persistLinks() {
@@ -1270,6 +1345,51 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 },
             )
         }
+    }
+
+    private fun loadDailyTraffic() {
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
+        val today = LocalDate.now().toString()
+        if (prefs.getString(PREF_DAILY_TRAFFIC_DATE, null) == today) {
+            dailyTrafficBytes = prefs.getLong(PREF_DAILY_TRAFFIC_BYTES, 0L)
+            dailyTaskCount = prefs.getInt(PREF_DAILY_TASK_COUNT, 0)
+        } else {
+            persistDailyTraffic(today, 0L, 0)
+        }
+    }
+
+    private fun addDailyTraffic(bytes: Long) {
+        if (bytes <= 0L) return
+        val today = LocalDate.now().toString()
+        if (getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
+                .getString(PREF_DAILY_TRAFFIC_DATE, null) != today) {
+            dailyTrafficBytes = 0L
+            dailyTaskCount = 0
+        }
+        dailyTrafficBytes += bytes
+        persistDailyTraffic(today, dailyTrafficBytes, dailyTaskCount)
+    }
+
+    private fun addDailyTaskCount(count: Int) {
+        if (count <= 0) return
+        val today = LocalDate.now().toString()
+        if (getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
+                .getString(PREF_DAILY_TRAFFIC_DATE, null) != today) {
+            dailyTrafficBytes = 0L
+            dailyTaskCount = 0
+        }
+        dailyTaskCount += count
+        persistDailyTraffic(today, dailyTrafficBytes, dailyTaskCount)
+    }
+
+    private fun persistDailyTraffic(date: String, bytes: Long, taskCount: Int) {
+        dailyTrafficBytes = bytes
+        dailyTaskCount = taskCount
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, 0).edit()
+            .putString(PREF_DAILY_TRAFFIC_DATE, date)
+            .putLong(PREF_DAILY_TRAFFIC_BYTES, bytes)
+            .putInt(PREF_DAILY_TASK_COUNT, taskCount)
+            .apply()
     }
 
     private fun currentRangeChunkSizeBytes(): Long = activeRangeChunkSizeBytes.get()
@@ -1409,12 +1529,14 @@ fun TrafficScreen(vm: TrafficViewModel) {
         ) {
             Tab(selected = page == 0, onClick = { page = 0 }, text = { Text("测速") })
             Tab(selected = page == 1, onClick = { page = 1 }, text = { Text("链接管理") })
-            Tab(selected = page == 2, onClick = { page = 2 }, text = { Text("设置") })
+            Tab(selected = page == 2, onClick = { page = 2 }, text = { Text("统计") })
+            Tab(selected = page == 3, onClick = { page = 3 }, text = { Text("设置") })
         }
 
         when (page) {
             0 -> SpeedPanel(vm)
             1 -> LinkManagePanel(vm = vm, onQuickTrafficStarted = { page = 0 })
+            2 -> StatsPanel(vm)
             else -> SettingsPanel(vm)
         }
     }
@@ -1677,7 +1799,142 @@ private fun SettingsPanel(vm: TrafficViewModel) {
         }
 
         item {
+            CloudAccountPanel(vm)
+        }
+
+        item {
             UpdatePanel(vm = vm, context = context)
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CloudAccountPanel(vm: TrafficViewModel) {
+    var apiBaseUrl by rememberSaveable { mutableStateOf("") }
+    var username by rememberSaveable { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("云端账号与统计", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            if (vm.cloudUsername.isNotBlank()) {
+                Text("已登录：${vm.cloudUsername}")
+                Button(onClick = vm::logoutCloudAccount) { Text("退出登录") }
+            } else {
+                OutlinedTextField(
+                    value = apiBaseUrl,
+                    onValueChange = { apiBaseUrl = it.trim() },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("云端 API 地址") },
+                    placeholder = { Text("https://api.example.com") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = username,
+                    onValueChange = { username = it.take(32) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("用户名") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = password,
+                    onValueChange = { password = it.take(128) },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("密码") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
+                    singleLine = true,
+                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Button(onClick = { vm.loginCloudAccount(apiBaseUrl, username, password) }) { Text("登录") }
+                    Button(onClick = { vm.registerCloudAccount(apiBaseUrl, username, password) }) { Text("注册") }
+                }
+            }
+            Text(
+                vm.cloudStatus,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun StatsPanel(vm: TrafficViewModel) {
+    var period by rememberSaveable { mutableStateOf("day") }
+    val labels = mapOf("day" to "日", "month" to "月", "year" to "年")
+    LazyColumn(
+        modifier = Modifier.fillMaxSize(),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text("流量统计排行", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text("本机今日流量：${formatBytes(vm.dailyTrafficBytes)}，任务数：${vm.dailyTaskCount}")
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        labels.forEach { (key, label) ->
+                            FilterChip(selected = period == key, onClick = { period = key }, label = { Text("${label}榜") })
+                        }
+                    }
+                    Button(onClick = { vm.refreshCloudStats(period) }, enabled = !vm.statsLoading) {
+                        Text(if (vm.statsLoading) "同步中..." else "同步并刷新排行")
+                    }
+                    Text(vm.cloudStatus, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("个人${labels[period]}统计", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    val stats = vm.personalStats
+                    Text("流量：${formatBytes(stats?.consumedBytes ?: 0L)}")
+                    Text("任务数：${stats?.taskCount ?: 0L}")
+                }
+            }
+        }
+        item {
+            Text("全体用户${labels[period]}流量排行", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+        }
+        items(vm.leaderboardEntries) { entry ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("#${entry.rank}  ${entry.username}", fontWeight = FontWeight.Medium)
+                    Text(formatBytes(entry.consumedBytes))
+                }
+            }
         }
     }
 }
