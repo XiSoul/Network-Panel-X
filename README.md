@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.4`
+Current version: `1.0.7`
 
 ## Features
 
@@ -21,6 +21,9 @@ Current version: `1.0.4`
 - Per-task progress, total progress, real-time speed, active thread count, and current chunk size display.
 - Adjustable thread count limit for concurrent download workers.
 - Optional background keep-alive while running.
+- Background service notification appears as soon as background keep-alive is enabled.
+- Pause and resume traffic directly from the notification without opening the app.
+- Check GitHub Releases and open the project release list from **在线更新**.
 - Light/dark theme switching.
 
 ## Settings
@@ -78,7 +81,7 @@ app/build/outputs/apk/release/app-release.apk
 For the current version, a copied release artifact can also be named:
 
 ```text
-app/build/outputs/apk/release/1.0.4.apk
+app/build/outputs/apk/release/1.0.7.apk
 ```
 
 ## Open In Android Studio

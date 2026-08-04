@@ -83,7 +83,6 @@ import android.widget.Toast
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelChildren
@@ -128,6 +127,7 @@ private const val PREF_USER_AGENT_LIST = "user_agent_list"
 private const val PREF_KEEP_ALIVE = "keep_alive"
 private const val PREF_KEEP_SCREEN_AWAKE = "keep_screen_awake"
 private const val PREF_PROGRESS_NOTIFICATION = "progress_notification"
+private const val LEGACY_ANDROID_APP_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; Network-Panel-X Build/UP1A.231005.007)"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
 private const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
@@ -141,6 +141,17 @@ private const val FAST_RETRY_DELAY_MS = 0L
 private const val WORKER_STAGGER_MS = 8L
 private const val QUICK_TRAFFIC_TARGET_GB_TEXT = "0.1"
 private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X/releases/latest"
+private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X/releases"
+const val ACTION_START_FROM_NOTIFICATION = "com.example.networkpanelx.action.START_FROM_NOTIFICATION"
+const val ACTION_STOP_FROM_NOTIFICATION = "com.example.networkpanelx.action.STOP_FROM_NOTIFICATION"
+const val ACTION_PAUSE_FROM_NOTIFICATION = "com.example.networkpanelx.action.PAUSE_FROM_NOTIFICATION"
+const val ACTION_RESUME_FROM_NOTIFICATION = "com.example.networkpanelx.action.RESUME_FROM_NOTIFICATION"
+
+data class SavedUserAgent(
+    val name: String,
+    val value: String,
+    val builtIn: Boolean = false,
+)
 
 data class ReleaseInfo(
     val version: String,
@@ -200,13 +211,26 @@ private fun compareVersions(left: String, right: String): Int {
     return 0
 }
 
-private fun defaultUserAgentOptions(): List<String> = listOf(COMMON_ANDROID_USER_AGENT)
+private fun defaultUserAgentOptions(): List<SavedUserAgent> = listOf(
+    SavedUserAgent(
+        name = "Android Chrome",
+        value = COMMON_ANDROID_USER_AGENT,
+        builtIn = true,
+    ),
+)
 
 class MainActivity : ComponentActivity() {
+    private lateinit var trafficViewModel: TrafficViewModel
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        trafficViewModel = ViewModelProvider(
+            this,
+            TrafficViewModel.Factory(application),
+        )[TrafficViewModel::class.java]
+        handleNotificationAction(intent)
         setContent {
-            val vm: TrafficViewModel = viewModel(factory = TrafficViewModel.Factory(application))
+            val vm = trafficViewModel
             MaterialTheme(
                 colorScheme = if (vm.isDarkTheme) {
                     darkColorScheme(
@@ -235,6 +259,40 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleNotificationAction(intent)
+    }
+
+    private fun handleNotificationAction(intent: Intent?) {
+        when (intent?.action) {
+            ACTION_START_FROM_NOTIFICATION -> trafficViewModel.start()
+            ACTION_STOP_FROM_NOTIFICATION -> trafficViewModel.stop()
+        }
+    }
+}
+
+object TrafficNotificationCommandBus {
+    @Volatile
+    private var viewModel: TrafficViewModel? = null
+
+    fun register(viewModel: TrafficViewModel) {
+        this.viewModel = viewModel
+    }
+
+    fun unregister(viewModel: TrafficViewModel) {
+        if (this.viewModel === viewModel) this.viewModel = null
+    }
+
+    fun pause() {
+        viewModel?.stop()
+    }
+
+    fun resume() {
+        viewModel?.start()
     }
 }
 
@@ -319,6 +377,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         loadTheme()
         loadSettings()
         nextId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
+        TrafficNotificationCommandBus.register(this)
+        if (keepAliveEnabled) syncKeepAliveService()
     }
 
     fun updateThreadCount(value: Int) {
@@ -394,24 +454,31 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectGlobalUserAgent(value: String) {
-        userAgentText = value
+        userAgentText = value.take(500)
         persistSettings()
     }
 
-    fun saveCurrentUserAgentToList() {
+    fun saveCurrentUserAgentToList(name: String) {
         val value = userAgentText.trim()
-        if (value.isEmpty()) return
-        if (userAgentOptions.none { it == value }) {
-            userAgentOptions = userAgentOptions + value
-            persistSettings()
-        }
+        val normalizedName = name.trim().take(40)
+        if (value.isEmpty() || normalizedName.isEmpty()) return
+        val existing = userAgentOptions.firstOrNull { it.name == normalizedName }
+        if (existing?.builtIn == true) return
+        userAgentOptions = userAgentOptions
+            .filterNot { it.name == normalizedName || (!it.builtIn && it.value == value) } +
+            SavedUserAgent(name = normalizedName, value = value)
+        persistSettings()
     }
 
     fun removeCurrentUserAgentFromList() {
         val value = userAgentText.trim()
         if (value.isEmpty()) return
-        userAgentOptions = userAgentOptions.filterNot { it == value }
+        userAgentOptions = userAgentOptions.filterNot { !it.builtIn && it.value == value }
         persistSettings()
+    }
+
+    fun canRemoveCurrentUserAgent(): Boolean = userAgentOptions.any {
+        !it.builtIn && it.value == userAgentText.trim()
     }
 
     fun clearGlobalUserAgent() {
@@ -1131,6 +1198,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         userAgentText = runCatching { prefs.getString(PREF_USER_AGENT, DEFAULT_USER_AGENT) }
             .getOrNull()
             ?: DEFAULT_USER_AGENT
+        if (userAgentText == LEGACY_ANDROID_APP_USER_AGENT) userAgentText = DEFAULT_USER_AGENT
         val userAgentListRaw = runCatching { prefs.getString(PREF_USER_AGENT_LIST, null) }.getOrNull()
         userAgentOptions = loadUserAgentOptions(userAgentListRaw)
         keepAliveEnabled = prefs.getBoolean(PREF_KEEP_ALIVE, true)
@@ -1145,7 +1213,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             .edit()
             .putInt(PREF_THREAD_COUNT, threadCount)
             .putString(PREF_USER_AGENT, userAgentText)
-            .putString(PREF_USER_AGENT_LIST, JSONArray(userAgentOptions).toString())
+            .putString(PREF_USER_AGENT_LIST, serializeUserAgentOptions(userAgentOptions).toString())
             .putBoolean(PREF_KEEP_ALIVE, keepAliveEnabled)
             .putBoolean(PREF_KEEP_SCREEN_AWAKE, keepScreenAwakeEnabled)
             .putBoolean(PREF_PROGRESS_NOTIFICATION, progressNotificationEnabled)
@@ -1156,17 +1224,52 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         return item.userAgent.trim().ifEmpty { userAgentText.trim() }.ifEmpty { null }
     }
 
-    private fun loadUserAgentOptions(raw: String?): List<String> {
+    private fun loadUserAgentOptions(raw: String?): List<SavedUserAgent> {
         if (raw.isNullOrBlank()) return defaultUserAgentOptions()
         return runCatching {
             val array = JSONArray(raw)
-            buildList {
+            buildList<SavedUserAgent> {
                 for (i in 0 until array.length()) {
-                    val value = array.optString(i).trim()
-                    if (value.isNotEmpty() && value !in this) add(value)
+                    when (val entry = array.opt(i)) {
+                        is JSONObject -> {
+                            val name = entry.optString("name").trim().take(40)
+                            val value = entry.optString("value").trim().take(500)
+                            if (
+                                name.isNotEmpty() &&
+                                value.isNotEmpty() &&
+                                value != LEGACY_ANDROID_APP_USER_AGENT &&
+                                none { it.name == name || it.value == value }
+                            ) {
+                                add(SavedUserAgent(name = name, value = value))
+                            }
+                        }
+
+                        is String -> {
+                            val value = entry.trim().take(500)
+                            if (value.isNotEmpty() && value != LEGACY_ANDROID_APP_USER_AGENT && none { it.value == value }) {
+                                val name = if (value == COMMON_ANDROID_USER_AGENT) "Android Chrome" else "自定义 UA ${size + 1}"
+                                add(SavedUserAgent(name = name, value = value))
+                            }
+                        }
+                    }
                 }
             }
-        }.getOrDefault(defaultUserAgentOptions()).ifEmpty { defaultUserAgentOptions() }
+        }.getOrDefault(emptyList())
+            .let { saved ->
+                val android = defaultUserAgentOptions().single()
+                listOf(android) + saved.filterNot { it.value == android.value }
+            }
+    }
+
+    private fun serializeUserAgentOptions(options: List<SavedUserAgent>): JSONArray = JSONArray().apply {
+        options.filterNot { it.builtIn }.forEach { option ->
+            put(
+                JSONObject().apply {
+                    put("name", option.name)
+                    put("value", option.value)
+                },
+            )
+        }
     }
 
     private fun currentRangeChunkSizeBytes(): Long = activeRangeChunkSizeBytes.get()
@@ -1191,13 +1294,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun computeActiveThreadCount(speedBytesPerSec: Long, contentLength: Long): Int {
-        val configuredThreads = threadCount.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
-        val desired = when {
-            contentLength in 1..(2L * 1024L * 1024L) -> minOf(configuredThreads, 4)
-            contentLength in 1..(16L * 1024L * 1024L) -> minOf(configuredThreads, 8)
-            contentLength in 1..(128L * 1024L * 1024L) -> minOf(configuredThreads, 16)
-            else -> configuredThreads
-        }
+        val desired = threadCount.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
         activeThreadCount = desired
         activeRangeChunkSizeBytes.set(chooseChunkSizeForContent(contentLength, speedBytesPerSec))
         return desired
@@ -1206,14 +1303,15 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun syncKeepAliveService() {
         val app = getApplication<Application>()
-        if (keepAliveEnabled && isRunning) {
+        if (keepAliveEnabled) {
             TrafficKeepAliveService.start(
                 context = app,
                 keepScreenAwake = keepScreenAwakeEnabled,
                 showProgress = progressNotificationEnabled,
+                taskRunning = isRunning,
                 taskName = currentTaskName,
-                consumedBytes = currentTaskConsumed,
-                targetBytes = currentTaskTarget,
+                totalConsumedBytes = totalConsumedBytes,
+                totalTargetBytes = totalTargetBytes,
                 speedBytesPerSec = currentSpeedBytesPerSec,
             )
         } else {
@@ -1222,19 +1320,21 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun updateBackgroundNotification() {
-        if (!keepAliveEnabled || !isRunning) return
+        if (!keepAliveEnabled) return
         TrafficKeepAliveService.update(
             context = getApplication(),
             keepScreenAwake = keepScreenAwakeEnabled,
             showProgress = progressNotificationEnabled,
+            taskRunning = isRunning,
             taskName = currentTaskName,
-            consumedBytes = currentTaskConsumed,
-            targetBytes = currentTaskTarget,
+            totalConsumedBytes = totalConsumedBytes,
+            totalTargetBytes = totalTargetBytes,
             speedBytesPerSec = currentSpeedBytesPerSec,
         )
     }
 
     override fun onCleared() {
+        TrafficNotificationCommandBus.unregister(this)
         super.onCleared()
         TrafficKeepAliveService.stop(getApplication())
         cronetEngine?.shutdown()
@@ -1399,7 +1499,6 @@ private fun SpeedPanel(vm: TrafficViewModel) {
                     Text("当前链接消耗：${formatBytes(vm.currentTaskConsumed)} / ${formatTargetBytes(vm.currentTaskTarget)}")
                     Text("总流量消耗：${formatBytes(vm.totalConsumedBytes)} / ${formatTargetBytes(vm.totalTargetBytes)}")
                     Text("活跃线程：${vm.activeThreadCount} / ${vm.threadCount}")
-                    Text("线程数上限：${vm.threadCount}", fontWeight = FontWeight.Medium)
                     Slider(
                         value = vm.threadCount.toFloat(),
                         onValueChange = { vm.updateThreadCount(it.toInt()) },
@@ -1458,6 +1557,7 @@ private fun SpeedPanel(vm: TrafficViewModel) {
 @Composable
 private fun SettingsPanel(vm: TrafficViewModel) {
     val context = LocalContext.current
+    var savedUserAgentName by rememberSaveable { mutableStateOf("") }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { vm.refreshBackgroundSystemStatus() }
@@ -1485,7 +1585,7 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                 ) {
                     Text("请求 UA", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     Text(
-                        "全局 UA 默认使用 Android Chrome。链接留空时继承这里的值，也可以从已保存的 UA 快速选择。",
+                        "内置 Android Chrome UA。链接留空时继承全局 UA；自定义 UA 可命名保存，便于链接快速选择。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
                     )
@@ -1502,16 +1602,30 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                         modifier = Modifier.fillMaxWidth(),
                         label = { Text("自定义全局 User-Agent") },
                         minLines = 2,
-                        supportingText = { Text("保存后可以在任一链接快速选用。") },
+                        supportingText = { Text("填写内容后，为它指定名称再保存。") },
+                    )
+                    OutlinedTextField(
+                        value = savedUserAgentName,
+                        onValueChange = { savedUserAgentName = it.take(40) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("UA 名称") },
+                        singleLine = true,
+                        supportingText = { Text("例如：云手机、线路 A") },
                     )
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(10.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp),
                     ) {
-                        Button(onClick = { vm.saveCurrentUserAgentToList() }, enabled = vm.userAgentText.isNotBlank()) {
-                            Text("保存到列表")
+                        Button(
+                            onClick = {
+                                vm.saveCurrentUserAgentToList(savedUserAgentName)
+                                savedUserAgentName = ""
+                            },
+                            enabled = vm.userAgentText.isNotBlank() && savedUserAgentName.isNotBlank(),
+                        ) {
+                            Text("保存为新 UA")
                         }
-                        Button(onClick = { vm.removeCurrentUserAgentFromList() }, enabled = vm.userAgentText.isNotBlank()) {
+                        Button(onClick = { vm.removeCurrentUserAgentFromList() }, enabled = vm.canRemoveCurrentUserAgent()) {
                             Text("从列表移除")
                         }
                         Button(onClick = { vm.clearGlobalUserAgent() }) {
@@ -1544,6 +1658,21 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                         Toast.makeText(context, "无法打开电池优化设置", Toast.LENGTH_SHORT).show()
                     }
                 },
+                onOpenNotificationSettings = {
+                    val intent = Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).apply {
+                        putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, TrafficKeepAliveService.notificationChannelId())
+                    }
+                    try {
+                        context.startActivity(intent)
+                    } catch (_: Exception) {
+                        context.startActivity(
+                            Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                                putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+                            },
+                        )
+                    }
+                },
             )
         }
 
@@ -1558,6 +1687,7 @@ private fun BackgroundSettingsPanel(
     vm: TrafficViewModel,
     onRequestNotificationPermission: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
+    onOpenNotificationSettings: () -> Unit,
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1590,7 +1720,7 @@ private fun BackgroundSettingsPanel(
             )
             BackgroundSettingRow(
                 title = "状态栏进度通知",
-                description = "显示当前链接、网速与进度；关闭后仍会保留 Android 必需的后台服务通知。",
+                description = "显示总流量、网速和任务状态文字，并在锁屏界面公开显示。",
                 checked = vm.progressNotificationEnabled,
                 onCheckedChange = vm::updateProgressNotificationEnabled,
                 enabled = vm.keepAliveEnabled,
@@ -1609,6 +1739,9 @@ private fun BackgroundSettingsPanel(
                 Button(onClick = onRequestNotificationPermission) {
                     Text("授权通知")
                 }
+            }
+            Button(onClick = onOpenNotificationSettings) {
+                Text("锁屏通知设置")
             }
 
             Text(
@@ -1726,6 +1859,9 @@ private fun UpdatePanel(vm: TrafficViewModel, context: Context) {
                 ) {
                     Text("检查更新")
                 }
+                Button(onClick = { openExternalLink(context, GITHUB_RELEASES_URL) }) {
+                    Text("GitHub 更新")
+                }
                 val available = vm.updateState as? UpdateState.Available
                 if (available != null) {
                     Button(
@@ -1755,22 +1891,12 @@ private fun openExternalLink(context: Context, url: String) {
     }
 }
 
-private fun userAgentLabel(value: String): String {
-    val normalized = value.trim()
-    return when {
-        normalized.isEmpty() -> ""
-        normalized == COMMON_ANDROID_USER_AGENT -> "Android Chrome（推荐）"
-        normalized.length <= 42 -> normalized
-        else -> "${normalized.take(42)}..."
-    }
-}
-
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun UserAgentDropdown(
     label: String,
     value: String,
-    options: List<String>,
+    options: List<SavedUserAgent>,
     emptyLabel: String,
     enabled: Boolean = true,
     onValueSelected: (String) -> Unit,
@@ -1781,7 +1907,7 @@ private fun UserAgentDropdown(
         onExpandedChange = { if (enabled) expanded = !expanded },
     ) {
         OutlinedTextField(
-            value = value.ifBlank { emptyLabel }.let(::userAgentLabel).ifBlank { emptyLabel },
+            value = options.firstOrNull { it.value == value }?.name ?: value.ifBlank { emptyLabel },
             onValueChange = {},
             modifier = Modifier
                 .menuAnchor()
@@ -1804,9 +1930,15 @@ private fun UserAgentDropdown(
             )
             options.forEach { option ->
                 DropdownMenuItem(
-                    text = { Text(userAgentLabel(option), maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                    text = {
+                        Text(
+                            option.name,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    },
                     onClick = {
-                        onValueSelected(option)
+                        onValueSelected(option.value)
                         expanded = false
                     },
                 )

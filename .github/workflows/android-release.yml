@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       release_ref:
-        description: "Git ref to build, for example 6eedede or v1.0.4"
+        description: "Git ref to build, for example 6eedede or v1.0.7"
         required: true
         type: string
       release_tag:
-        description: "GitHub release tag, for example v1.0.4"
+        description: "GitHub release tag, for example v1.0.7"
         required: true
         type: string
 
