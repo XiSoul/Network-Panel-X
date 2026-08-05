@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.8`
+Current version: `1.0.9`
 
 ## Cloud Accounts And Rankings
 
@@ -96,7 +96,7 @@ app/build/outputs/apk/release/app-release.apk
 For the current version, a copied release artifact can also be named:
 
 ```text
-app/build/outputs/apk/release/1.0.8.apk
+app/build/outputs/apk/release/1.0.9.apk
 ```
 
 ## Open In Android Studio

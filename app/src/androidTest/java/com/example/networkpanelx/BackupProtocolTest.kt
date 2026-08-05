@@ -56,6 +56,7 @@ class BackupProtocolTest {
         }
         server.start()
         val directory = server.url("/dav/backups/").toString()
+            .replace("/dav/backups/", "/dav/network panel x/")
         val document = JSONObject().put("schemaVersion", 1).put("links", org.json.JSONArray())
 
         val uploaded = WebDavBackup.upload(directory, "user", "password", document)

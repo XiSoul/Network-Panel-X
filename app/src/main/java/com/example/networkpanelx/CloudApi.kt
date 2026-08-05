@@ -8,6 +8,7 @@ import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -256,8 +257,10 @@ object WebDavBackup {
 
     private fun normalizeDirectoryUrl(value: String): String {
         val url = value.trim()
-        require(url.startsWith("https://") || url.startsWith("http://")) { "WebDAV 目录必须以 http:// 或 https:// 开头" }
-        return url.trimEnd('/') + "/"
+        val parsed = url.toHttpUrlOrNull()
+            ?: throw IllegalArgumentException("WebDAV 目录必须是有效的 http:// 或 https:// 地址")
+        require(parsed.scheme == "http" || parsed.scheme == "https") { "WebDAV 目录必须以 http:// 或 https:// 开头" }
+        return parsed.toString().trimEnd('/') + "/"
     }
 
     private fun parseWebDavList(xml: String, directoryUrl: String): List<RemoteBackup> {
