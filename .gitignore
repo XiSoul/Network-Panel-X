@@ -8,6 +8,7 @@ local.properties
 signing-secrets.txt
 app/signing/
 server/.env
+server/.smtp.env
 server/node_modules/
 server/ca.pem
 

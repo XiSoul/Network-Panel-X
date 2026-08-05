@@ -1,8 +1,10 @@
 import express from "express";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+import { randomInt } from "node:crypto";
 import { config } from "./config.mjs";
 import { pool } from "./db.mjs";
+import { sendVerificationCode } from "./email.mjs";
 
 const app = express();
 app.disable("x-powered-by");
@@ -16,17 +18,80 @@ app.use((request, response, next) => {
 });
 
 const usernamePattern = /^[A-Za-z0-9_]{3,32}$/;
+const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const verificationLifetimeMs = 10 * 60 * 1000;
+const verificationCooldownMs = 60 * 1000;
+const maxVerificationAttempts = 5;
+const rateLimitBuckets = new Map();
 
 function normalizeUsername(value) {
   return String(value || "").trim().toLowerCase();
 }
 
-function validateCredentials(username, password) {
-  if (!usernamePattern.test(username)) return "用户名仅支持 3-32 位字母、数字和下划线";
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function validatePassword(password) {
   if (typeof password !== "string" || password.length < 8 || password.length > 128) {
     return "密码长度必须为 8-128 位";
   }
   return null;
+}
+
+function validateCredentials(username, password) {
+  if (!usernamePattern.test(username)) return "用户名仅支持 3-32 位字母、数字和下划线";
+  return validatePassword(password);
+}
+
+function validateEmail(email) {
+  return email.length <= 254 && emailPattern.test(email) ? null : "邮箱格式不正确";
+}
+
+function isRateLimited(key, maximum, windowMs) {
+  const now = Date.now();
+  const timestamps = (rateLimitBuckets.get(key) || []).filter((value) => value > now - windowMs);
+  if (timestamps.length >= maximum) {
+    rateLimitBuckets.set(key, timestamps);
+    return true;
+  }
+  timestamps.push(now);
+  rateLimitBuckets.set(key, timestamps);
+  if (rateLimitBuckets.size > 10_000) {
+    for (const [bucketKey, values] of rateLimitBuckets) {
+      if (!values.some((value) => value > now - windowMs)) rateLimitBuckets.delete(bucketKey);
+    }
+  }
+  return false;
+}
+
+function createVerificationCode() {
+  return String(randomInt(100_000, 1_000_000));
+}
+
+async function verifyCode({ purpose, emailNormalized, code }) {
+  const [rows] = await pool.execute(
+    `SELECT code_hash, expires_at, attempt_count, username, username_normalized, pending_password_hash
+     FROM email_verifications WHERE purpose = ? AND email_normalized = ? LIMIT 1`,
+    [purpose, emailNormalized],
+  );
+  const verification = rows[0];
+  if (!verification || new Date(verification.expires_at).getTime() <= Date.now()) {
+    await pool.execute("DELETE FROM email_verifications WHERE purpose = ? AND email_normalized = ?", [purpose, emailNormalized]);
+    return { error: "验证码无效或已过期" };
+  }
+  if (verification.attempt_count >= maxVerificationAttempts) {
+    await pool.execute("DELETE FROM email_verifications WHERE purpose = ? AND email_normalized = ?", [purpose, emailNormalized]);
+    return { error: "验证码错误次数过多，请重新获取" };
+  }
+  if (typeof code !== "string" || !/^\d{6}$/.test(code) || !(await bcrypt.compare(code, verification.code_hash))) {
+    await pool.execute(
+      "UPDATE email_verifications SET attempt_count = attempt_count + 1 WHERE purpose = ? AND email_normalized = ?",
+      [purpose, emailNormalized],
+    );
+    return { error: "验证码无效或已过期" };
+  }
+  return { verification };
 }
 
 function issueToken(user) {
@@ -78,24 +143,148 @@ app.get("/health", async (_request, response, next) => {
   }
 });
 
+app.post("/v1/auth/register/request-code", async (request, response, next) => {
+  try {
+    const username = String(request.body?.username || "").trim();
+    const password = request.body?.password;
+    const email = String(request.body?.email || "").trim();
+    const emailNormalized = normalizeEmail(email);
+    const validationError = validateCredentials(username, password);
+    if (validationError) return response.status(400).json({ error: validationError });
+    const emailValidationError = validateEmail(emailNormalized);
+    if (emailValidationError) return response.status(400).json({ error: emailValidationError });
+    if (isRateLimited(`register:${request.ip}`, 5, 15 * 60 * 1000)) {
+      return response.status(429).json({ error: "请求过于频繁，请稍后再试" });
+    }
+
+    const usernameNormalized = normalizeUsername(username);
+    const [existing] = await pool.execute(
+      "SELECT username_normalized, email_normalized FROM users WHERE username_normalized = ? OR email_normalized = ? LIMIT 1",
+      [usernameNormalized, emailNormalized],
+    );
+    if (existing.length) {
+      const isUsername = existing[0].username_normalized === usernameNormalized;
+      return response.status(409).json({ error: isUsername ? "用户名已存在" : "邮箱已被注册" });
+    }
+    const [previous] = await pool.execute(
+      "SELECT sent_at FROM email_verifications WHERE purpose = 'register' AND email_normalized = ? LIMIT 1",
+      [emailNormalized],
+    );
+    if (previous[0] && Date.now() - new Date(previous[0].sent_at).getTime() < verificationCooldownMs) {
+      return response.status(429).json({ error: "验证码已发送，请 60 秒后再试" });
+    }
+    const code = createVerificationCode();
+    const [passwordHash, codeHash] = await Promise.all([bcrypt.hash(password, 12), bcrypt.hash(code, 12)]);
+    await sendVerificationCode({ email, code, purpose: "register" });
+    await pool.execute(
+      `INSERT INTO email_verifications
+        (purpose, email, email_normalized, username, username_normalized, pending_password_hash, code_hash, expires_at, sent_at, attempt_count)
+       VALUES ('register', ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3), 0)
+       ON DUPLICATE KEY UPDATE email = VALUES(email), username = VALUES(username), username_normalized = VALUES(username_normalized),
+         pending_password_hash = VALUES(pending_password_hash), code_hash = VALUES(code_hash), expires_at = VALUES(expires_at),
+         sent_at = CURRENT_TIMESTAMP(3), attempt_count = 0`,
+      [email, emailNormalized, username, usernameNormalized, passwordHash, codeHash, new Date(Date.now() + verificationLifetimeMs)],
+    );
+    response.status(202).json({ message: "验证码已发送到邮箱" });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/v1/auth/register", async (request, response, next) => {
   try {
     const username = String(request.body?.username || "").trim();
     const password = request.body?.password;
-    const validationError = validateCredentials(username, password);
+    const email = String(request.body?.email || "").trim();
+    const emailNormalized = normalizeEmail(email);
+    const validationError = validateCredentials(username, password) || validateEmail(emailNormalized);
     if (validationError) return response.status(400).json({ error: validationError });
-
-    const passwordHash = await bcrypt.hash(password, 12);
+    const checked = await verifyCode({ purpose: "register", emailNormalized, code: request.body?.code });
+    if (checked.error) return response.status(400).json({ error: checked.error });
+    const verification = checked.verification;
+    if (verification.username_normalized !== normalizeUsername(username) || !(await bcrypt.compare(password, verification.pending_password_hash))) {
+      return response.status(400).json({ error: "注册信息与验证码不匹配，请重新获取验证码" });
+    }
+    const connection = await pool.getConnection();
     try {
-      const [result] = await pool.execute(
-        "INSERT INTO users (username, username_normalized, password_hash) VALUES (?, ?, ?)",
-        [username, normalizeUsername(username), passwordHash],
+      await connection.beginTransaction();
+      const [result] = await connection.execute(
+        "INSERT INTO users (username, username_normalized, email, email_normalized, password_hash, email_verified_at) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP(3))",
+        [username, normalizeUsername(username), email, emailNormalized, verification.pending_password_hash],
       );
+      await connection.execute("DELETE FROM email_verifications WHERE purpose = 'register' AND email_normalized = ?", [emailNormalized]);
+      await connection.commit();
       const user = { id: result.insertId, username };
       response.status(201).json({ token: issueToken(user), user });
     } catch (error) {
-      if (error?.code === "ER_DUP_ENTRY") return response.status(409).json({ error: "用户名已存在" });
+      await connection.rollback();
+      if (error?.code === "ER_DUP_ENTRY") return response.status(409).json({ error: "用户名或邮箱已被注册" });
       throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/auth/password-reset/request-code", async (request, response, next) => {
+  try {
+    const email = String(request.body?.email || "").trim();
+    const emailNormalized = normalizeEmail(email);
+    const emailValidationError = validateEmail(emailNormalized);
+    if (emailValidationError) return response.status(400).json({ error: emailValidationError });
+    if (isRateLimited(`reset:${request.ip}`, 5, 15 * 60 * 1000)) {
+      return response.status(429).json({ error: "请求过于频繁，请稍后再试" });
+    }
+    const [users] = await pool.execute("SELECT id FROM users WHERE email_normalized = ? LIMIT 1", [emailNormalized]);
+    if (!users.length) return response.status(202).json({ message: "若该邮箱已注册，验证码将发送到邮箱" });
+    const [previous] = await pool.execute(
+      "SELECT sent_at FROM email_verifications WHERE purpose = 'reset' AND email_normalized = ? LIMIT 1",
+      [emailNormalized],
+    );
+    if (previous[0] && Date.now() - new Date(previous[0].sent_at).getTime() < verificationCooldownMs) {
+      return response.status(429).json({ error: "验证码已发送，请 60 秒后再试" });
+    }
+    const code = createVerificationCode();
+    await sendVerificationCode({ email, code, purpose: "reset" });
+    await pool.execute(
+      `INSERT INTO email_verifications (purpose, email, email_normalized, code_hash, expires_at, sent_at, attempt_count)
+       VALUES ('reset', ?, ?, ?, ?, CURRENT_TIMESTAMP(3), 0)
+       ON DUPLICATE KEY UPDATE email = VALUES(email), code_hash = VALUES(code_hash), expires_at = VALUES(expires_at),
+         sent_at = CURRENT_TIMESTAMP(3), attempt_count = 0`,
+      [email, emailNormalized, await bcrypt.hash(code, 12), new Date(Date.now() + verificationLifetimeMs)],
+    );
+    response.status(202).json({ message: "若该邮箱已注册，验证码将发送到邮箱" });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/auth/password-reset/confirm", async (request, response, next) => {
+  try {
+    const emailNormalized = normalizeEmail(request.body?.email);
+    const password = request.body?.newPassword;
+    const validationError = validateEmail(emailNormalized) || validatePassword(password);
+    if (validationError) return response.status(400).json({ error: validationError });
+    const checked = await verifyCode({ purpose: "reset", emailNormalized, code: request.body?.code });
+    if (checked.error) return response.status(400).json({ error: checked.error });
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [result] = await connection.execute(
+        "UPDATE users SET password_hash = ? WHERE email_normalized = ?",
+        [await bcrypt.hash(password, 12), emailNormalized],
+      );
+      await connection.execute("DELETE FROM email_verifications WHERE purpose = 'reset' AND email_normalized = ?", [emailNormalized]);
+      await connection.commit();
+      if (!result.affectedRows) return response.status(400).json({ error: "验证码无效或已过期" });
+      response.json({ message: "密码已重置，请使用新密码登录" });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
     }
   } catch (error) {
     next(error);

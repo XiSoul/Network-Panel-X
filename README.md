@@ -8,7 +8,7 @@ Current version: `1.0.7`
 
 ## Cloud Accounts And Rankings
 
-The optional account and leaderboard service is under `server/`. It stores only account password hashes and aggregated daily traffic in TiDB. The Android app never contains TiDB credentials.
+The optional account and leaderboard service is under `server/`. New accounts require a verified email code; password recovery also uses a code sent to that verified email. It stores password and code hashes plus aggregated daily traffic in TiDB. The Android app never contains TiDB or SMTP credentials.
 
 Before using login and rankings on a device, deploy `server/` to a public Node host and set `DEFAULT_CLOUD_API_URL` in `CloudApi.kt` for the release build. The address is built into the app and is not entered by end users. A Dockerfile and `render.yaml` are included for a Render deployment; setup details are in `server/README.md`.
 

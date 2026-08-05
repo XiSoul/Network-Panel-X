@@ -4,7 +4,7 @@ This service owns user accounts and aggregated traffic rankings. The Android app
 
 ## Setup
 
-1. Copy `.env.example` to `.env` and fill in the rotated TiDB credentials and JWT secret.
+1. Copy `.env.example` to `.env` and fill in the rotated TiDB credentials, JWT secret, and SMTP credentials. QQ Mail uses `smtp.qq.com`, SSL port `465`, `SMTP_SECURE=true`, and its SMTP authorization code as `SMTP_PASSWORD`.
 2. Set `DATABASE_CA_PATH` to the downloaded TiDB CA certificate, for example `E:\\isrgrootx1.pem` on Windows.
 3. Install dependencies and apply the schema:
 
@@ -16,20 +16,26 @@ npm start
 
 The migration creates:
 
-- `users`: unique normalized usernames and bcrypt password hashes.
+- `users`: unique normalized usernames, verified email addresses, and bcrypt password hashes.
 - `traffic_daily`: one absolute daily traffic row per user, including year, month, and day fields for ranking queries.
+- `email_verifications`: short-lived, hashed email codes for registration and password resets.
 
 ## API
 
 | Method | Path | Purpose |
 | --- | --- | --- |
-| `POST` | `/v1/auth/register` | Register a username and password. |
+| `POST` | `/v1/auth/register/request-code` | Send a registration code after validating username, email, and password. |
+| `POST` | `/v1/auth/register` | Create the account after the email code is verified. |
 | `POST` | `/v1/auth/login` | Verify credentials and issue a 30-day bearer token. |
+| `POST` | `/v1/auth/password-reset/request-code` | Send a password-reset code without revealing whether the email exists. |
+| `POST` | `/v1/auth/password-reset/confirm` | Verify the reset code and set a new password. |
 | `POST` | `/v1/traffic/sync` | Upload the user's current absolute daily traffic total. |
 | `GET` | `/v1/stats/me?period=day|month|year` | Read personal statistics. |
 | `GET` | `/v1/leaderboard?period=day|month|year` | Read the top 100 users. |
 
 WebDAV/S3 backup credentials and backup files remain user-owned and are not sent to this API.
+
+Verification codes are six digits, expire after 10 minutes, allow at most five incorrect attempts, and have a 60-second resend cooldown. Only bcrypt hashes of codes and passwords are stored. SMTP credentials belong in an ignored local `.env` or `.smtp.env` file, never in Git.
 
 ## Deploy
 

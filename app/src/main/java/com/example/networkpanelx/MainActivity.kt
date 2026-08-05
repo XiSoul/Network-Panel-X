@@ -441,12 +441,39 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun registerCloudAccount(apiBaseUrl: String, username: String, password: String) = authenticateCloudAccount {
-        CloudApi.register(apiBaseUrl, username, password)
+    fun requestCloudRegistrationCode(apiBaseUrl: String, username: String, email: String, password: String) {
+        cloudStatus = "正在发送注册验证码..."
+        viewModelScope.launch {
+            runCatching { CloudApi.requestRegistrationCode(apiBaseUrl, username, email, password) }
+                .onSuccess { cloudStatus = it.ifBlank { "验证码已发送到邮箱" } }
+                .onFailure { cloudStatus = it.message ?: "验证码发送失败" }
+        }
+    }
+
+    fun registerCloudAccount(apiBaseUrl: String, username: String, email: String, password: String, code: String) = authenticateCloudAccount {
+        CloudApi.register(apiBaseUrl, username, email, password, code)
     }
 
     fun loginCloudAccount(apiBaseUrl: String, username: String, password: String) = authenticateCloudAccount {
         CloudApi.login(apiBaseUrl, username, password)
+    }
+
+    fun requestCloudPasswordResetCode(apiBaseUrl: String, email: String) {
+        cloudStatus = "正在发送找回验证码..."
+        viewModelScope.launch {
+            runCatching { CloudApi.requestPasswordResetCode(apiBaseUrl, email) }
+                .onSuccess { cloudStatus = it.ifBlank { "若该邮箱已注册，验证码将发送到邮箱" } }
+                .onFailure { cloudStatus = it.message ?: "验证码发送失败" }
+        }
+    }
+
+    fun resetCloudPassword(apiBaseUrl: String, email: String, code: String, newPassword: String) {
+        cloudStatus = "正在重置密码..."
+        viewModelScope.launch {
+            runCatching { CloudApi.confirmPasswordReset(apiBaseUrl, email, code, newPassword) }
+                .onSuccess { cloudStatus = it.ifBlank { "密码已重置，请使用新密码登录" } }
+                .onFailure { cloudStatus = it.message ?: "密码重置失败" }
+        }
     }
 
     fun logoutCloudAccount() {
@@ -2198,6 +2225,9 @@ private fun formatBackupTime(epochMs: Long): String {
 private fun CloudAccountPanel(vm: TrafficViewModel) {
     var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var email by rememberSaveable { mutableStateOf("") }
+    var code by rememberSaveable { mutableStateOf("") }
+    var accountMode by rememberSaveable { mutableStateOf("login") }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -2213,28 +2243,67 @@ private fun CloudAccountPanel(vm: TrafficViewModel) {
                 Text("已登录：${vm.cloudUsername}")
                 Button(onClick = vm::logoutCloudAccount) { Text("退出登录") }
             } else {
-                OutlinedTextField(
-                    value = username,
-                    onValueChange = { username = it.take(32) },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("用户名") },
-                    singleLine = true,
-                )
+                FlowRow(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    FilterChip(selected = accountMode == "login", onClick = { accountMode = "login" }, label = { Text("登录") })
+                    FilterChip(selected = accountMode == "register", onClick = { accountMode = "register" }, label = { Text("注册") })
+                    FilterChip(selected = accountMode == "reset", onClick = { accountMode = "reset" }, label = { Text("忘记密码") })
+                }
+                if (accountMode != "reset") {
+                    OutlinedTextField(
+                        value = username,
+                        onValueChange = { username = it.take(32) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("用户名") },
+                        singleLine = true,
+                    )
+                }
+                if (accountMode != "login") {
+                    OutlinedTextField(
+                        value = email,
+                        onValueChange = { email = it.take(254) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("邮箱") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                        singleLine = true,
+                    )
+                }
                 OutlinedTextField(
                     value = password,
                     onValueChange = { password = it.take(128) },
                     modifier = Modifier.fillMaxWidth(),
-                    label = { Text("密码") },
+                    label = { Text(if (accountMode == "reset") "新密码" else "密码") },
                     visualTransformation = PasswordVisualTransformation(),
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     singleLine = true,
                 )
+                if (accountMode != "login") {
+                    OutlinedTextField(
+                        value = code,
+                        onValueChange = { code = it.filter(Char::isDigit).take(6) },
+                        modifier = Modifier.fillMaxWidth(),
+                        label = { Text("邮箱验证码") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        singleLine = true,
+                    )
+                }
                 FlowRow(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Button(onClick = { vm.loginCloudAccount(DEFAULT_CLOUD_API_URL, username, password) }) { Text("登录") }
-                    Button(onClick = { vm.registerCloudAccount(DEFAULT_CLOUD_API_URL, username, password) }) { Text("注册") }
+                    when (accountMode) {
+                        "login" -> Button(onClick = { vm.loginCloudAccount(DEFAULT_CLOUD_API_URL, username, password) }) { Text("登录") }
+                        "register" -> {
+                            Button(onClick = { vm.requestCloudRegistrationCode(DEFAULT_CLOUD_API_URL, username, email, password) }) { Text("发送验证码") }
+                            Button(onClick = { vm.registerCloudAccount(DEFAULT_CLOUD_API_URL, username, email, password, code) }) { Text("完成注册") }
+                        }
+                        else -> {
+                            Button(onClick = { vm.requestCloudPasswordResetCode(DEFAULT_CLOUD_API_URL, email) }) { Text("发送验证码") }
+                            Button(onClick = { vm.resetCloudPassword(DEFAULT_CLOUD_API_URL, email, code, password) }) { Text("重置密码") }
+                        }
+                    }
                 }
             }
             Text(

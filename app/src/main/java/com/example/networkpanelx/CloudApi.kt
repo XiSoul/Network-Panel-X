@@ -85,11 +85,32 @@ object CloudApi {
         .readTimeout(20, TimeUnit.SECONDS)
         .build()
 
-    suspend fun register(apiBaseUrl: String, username: String, password: String): CloudSession =
-        authenticate(apiBaseUrl, "register", username, password)
+    suspend fun requestRegistrationCode(apiBaseUrl: String, username: String, email: String, password: String): String =
+        requestAuthMessage(
+            apiBaseUrl,
+            "/v1/auth/register/request-code",
+            JSONObject().put("username", username).put("email", email).put("password", password),
+        )
+
+    suspend fun register(apiBaseUrl: String, username: String, email: String, password: String, code: String): CloudSession =
+        authenticate(
+            apiBaseUrl,
+            "register",
+            JSONObject().put("username", username).put("email", email).put("password", password).put("code", code),
+        )
 
     suspend fun login(apiBaseUrl: String, username: String, password: String): CloudSession =
-        authenticate(apiBaseUrl, "login", username, password)
+        authenticate(apiBaseUrl, "login", JSONObject().put("username", username).put("password", password))
+
+    suspend fun requestPasswordResetCode(apiBaseUrl: String, email: String): String =
+        requestAuthMessage(apiBaseUrl, "/v1/auth/password-reset/request-code", JSONObject().put("email", email))
+
+    suspend fun confirmPasswordReset(apiBaseUrl: String, email: String, code: String, newPassword: String): String =
+        requestAuthMessage(
+            apiBaseUrl,
+            "/v1/auth/password-reset/confirm",
+            JSONObject().put("email", email).put("code", code).put("newPassword", newPassword),
+        )
 
     suspend fun syncTraffic(session: CloudSession, consumedBytes: Long, taskCount: Long) {
         requestJson(
@@ -123,19 +144,24 @@ object CloudApi {
         }
     }
 
-    private suspend fun authenticate(apiBaseUrl: String, endpoint: String, username: String, password: String): CloudSession {
+    private suspend fun authenticate(apiBaseUrl: String, endpoint: String, body: JSONObject): CloudSession {
         val baseUrl = normalizeBaseUrl(apiBaseUrl)
         val json = requestJson(
             session = null,
             method = "POST",
             path = "/v1/auth/$endpoint",
-            body = JSONObject().put("username", username).put("password", password),
+            body = body,
             baseUrl = baseUrl,
         )
         val user = json.optJSONObject("user") ?: throw IllegalStateException("服务器未返回用户信息")
         val token = json.optString("token")
         if (token.isBlank()) throw IllegalStateException("服务器未返回登录令牌")
-        return CloudSession(baseUrl, user.optString("username", username), token)
+        return CloudSession(baseUrl, user.optString("username"), token)
+    }
+
+    private suspend fun requestAuthMessage(apiBaseUrl: String, path: String, body: JSONObject): String {
+        val json = requestJson(session = null, method = "POST", path = path, body = body, baseUrl = normalizeBaseUrl(apiBaseUrl))
+        return json.optString("message")
     }
 
     private suspend fun requestJson(
