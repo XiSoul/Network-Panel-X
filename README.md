@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.7`
+Current version: `1.0.8`
 
 ## Cloud Accounts And Rankings
 
@@ -32,6 +32,7 @@ Before using login and rankings on a device, deploy `server/` to a public Node h
 - Check GitHub Releases and open the project release list from **在线更新**.
 - Light/dark theme switching.
 - Optional WebDAV or S3-compatible backup and restore for links, User-Agent profiles, runtime settings, and today's local statistics.
+- Backup browser accepts both timestamped versions and legacy JSON backups; daily cloud traffic is restored locally after account login.
 
 ## Settings
 
@@ -95,7 +96,7 @@ app/build/outputs/apk/release/app-release.apk
 For the current version, a copied release artifact can also be named:
 
 ```text
-app/build/outputs/apk/release/1.0.7.apk
+app/build/outputs/apk/release/1.0.8.apk
 ```
 
 ## Open In Android Studio

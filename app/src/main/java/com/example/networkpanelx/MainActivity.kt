@@ -188,6 +188,29 @@ data class LinkItem(
     val status: String = "未开始",
 )
 
+internal fun serializeLinksForBackup(links: List<LinkItem>): JSONArray = JSONArray().apply {
+    links.forEach { link ->
+        put(JSONObject().apply {
+            put("id", link.id)
+            put("name", link.name)
+            put("url", link.url)
+            put("targetGbText", link.targetGbText)
+            put("userAgent", link.userAgent)
+            put("enabled", link.enabled)
+        })
+    }
+}
+
+internal fun mergeDailyTrafficWithCloud(
+    localBytes: Long,
+    localTaskCount: Int,
+    cloudBytes: Long,
+    cloudTaskCount: Long,
+): Pair<Long, Int> = maxOf(localBytes, cloudBytes.coerceAtLeast(0L)) to maxOf(
+    localTaskCount,
+    cloudTaskCount.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+)
+
 data class ParsedTask(
     val id: Long,
     val name: String,
@@ -574,23 +597,13 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             put("progressNotification", progressNotificationEnabled)
             put("themeDark", isDarkTheme)
         }
-        val linkArray = JSONArray().apply {
-            links.forEach { link ->
-                put(JSONObject().apply {
-                    put("id", link.id)
-                    put("name", link.name)
-                    put("url", link.url)
-                    put("targetGbText", link.targetGbText)
-                    put("userAgent", link.userAgent)
-                    put("enabled", link.enabled)
-                })
-            }
-        }
+        val linkArray = serializeLinksForBackup(links)
         return JSONObject().apply {
             put("schemaVersion", 1)
             put("appVersion", BuildConfig.VERSION_NAME)
             put("createdAt", Instant.now().toString())
             put("links", linkArray)
+            put("linkCount", linkArray.length())
             put("settings", settings)
             put("dailyTraffic", JSONObject().apply {
                 val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
@@ -659,11 +672,26 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 CloudApi.syncTraffic(session, dailyTrafficBytes, dailyTaskCount.toLong())
                 CloudApi.personalStats(session, period) to CloudApi.leaderboard(session, period)
             }.onSuccess { (stats, entries) ->
+                if (period == "day") {
+                    restoreDailyTrafficFromCloud(stats)
+                }
                 personalStats = stats
                 leaderboardEntries = entries
                 cloudStatus = "已同步${stats.period}统计"
             }.onFailure { cloudStatus = it.message ?: "云端统计读取失败" }
             statsLoading = false
+        }
+    }
+
+    private fun restoreDailyTrafficFromCloud(stats: CloudTrafficStats) {
+        val (restoredBytes, restoredTasks) = mergeDailyTrafficWithCloud(
+            dailyTrafficBytes,
+            dailyTaskCount,
+            stats.consumedBytes,
+            stats.taskCount,
+        )
+        if (restoredBytes != dailyTrafficBytes || restoredTasks != dailyTaskCount) {
+            persistDailyTraffic(LocalDate.now().toString(), restoredBytes, restoredTasks)
         }
     }
 

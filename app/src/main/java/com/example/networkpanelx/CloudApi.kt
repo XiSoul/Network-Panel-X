@@ -208,7 +208,10 @@ data class RemoteBackup(
 )
 
 private fun createBackupFileName(): String = "$BACKUP_FILE_PREFIX${backupNameFormatter.format(Instant.now())}-${UUID.randomUUID().toString().take(8)}$BACKUP_FILE_SUFFIX"
-private fun isBackupFile(name: String): Boolean = name.startsWith(BACKUP_FILE_PREFIX) && name.endsWith(BACKUP_FILE_SUFFIX)
+// A backup directory may contain versions created before the versioned-file format.
+// Show every JSON document so users can restore an existing `backup.json` as well.
+private fun isBackupFile(name: String): Boolean = name.endsWith(BACKUP_FILE_SUFFIX, ignoreCase = true)
+private fun xmlLocalName(name: String): String = name.substringAfterLast(':').lowercase()
 
 object WebDavBackup {
     private val client = OkHttpClient.Builder().connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
@@ -265,7 +268,7 @@ object WebDavBackup {
         var size = 0L
         while (parser.eventType != XmlPullParser.END_DOCUMENT) {
             when (parser.eventType) {
-                XmlPullParser.START_TAG -> when (parser.name.lowercase()) {
+                XmlPullParser.START_TAG -> when (xmlLocalName(parser.name)) {
                     "response" -> {
                         href = ""
                         modifiedAt = 0L
@@ -275,7 +278,7 @@ object WebDavBackup {
                     "getlastmodified" -> modifiedAt = parseRemoteTime(parser.nextText())
                     "getcontentlength" -> size = parser.nextText().trim().toLongOrNull() ?: 0L
                 }
-                XmlPullParser.END_TAG -> if (parser.name.equals("response", ignoreCase = true) && href.isNotBlank()) {
+                XmlPullParser.END_TAG -> if (xmlLocalName(parser.name) == "response" && href.isNotBlank()) {
                     val resolved = URI(directoryUrl).resolve(href).toString()
                     val fileName = URI(resolved).path.trimEnd('/').substringAfterLast('/')
                     if (isBackupFile(fileName)) backups += RemoteBackup(resolved, fileName, modifiedAt, size)
@@ -428,18 +431,18 @@ object S3Backup {
         var nextToken: String? = null
         while (parser.eventType != XmlPullParser.END_DOCUMENT) {
             when (parser.eventType) {
-                XmlPullParser.START_TAG -> when (parser.name) {
-                    "Contents" -> {
+                XmlPullParser.START_TAG -> when (xmlLocalName(parser.name)) {
+                    "contents" -> {
                         key = ""
                         modifiedAt = 0L
                         size = 0L
                     }
-                    "Key" -> key = parser.nextText()
-                    "LastModified" -> modifiedAt = parseRemoteTime(parser.nextText())
-                    "Size" -> size = parser.nextText().toLongOrNull() ?: 0L
-                    "NextContinuationToken" -> nextToken = parser.nextText().ifBlank { null }
+                    "key" -> key = parser.nextText()
+                    "lastmodified" -> modifiedAt = parseRemoteTime(parser.nextText())
+                    "size" -> size = parser.nextText().toLongOrNull() ?: 0L
+                    "nextcontinuationtoken" -> nextToken = parser.nextText().ifBlank { null }
                 }
-                XmlPullParser.END_TAG -> if (parser.name == "Contents" && key.isNotBlank()) {
+                XmlPullParser.END_TAG -> if (xmlLocalName(parser.name) == "contents" && key.isNotBlank()) {
                     backups += RemoteBackup(key, key.substringAfterLast('/'), modifiedAt, size)
                 }
             }

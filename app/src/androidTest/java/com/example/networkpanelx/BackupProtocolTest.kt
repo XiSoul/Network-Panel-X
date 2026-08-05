@@ -70,6 +70,39 @@ class BackupProtocolTest {
     }
 
     @Test
+    fun backupSerializationContainsEveryLinkAndWebDavListsLegacyJson() = runBlocking {
+        val links = listOf(
+            LinkItem(id = 1, name = "主线路", url = "https://example.com/a", targetGbText = "1", userAgent = "UA-A"),
+            LinkItem(id = 2, name = "备用线路", url = "https://example.com/b", targetGbText = "2", userAgent = "UA-B", enabled = false),
+        )
+        val serialized = serializeLinksForBackup(links)
+        assertEquals(2, serialized.length())
+        assertEquals("https://example.com/a", serialized.getJSONObject(0).getString("url"))
+        assertEquals(false, serialized.getJSONObject(1).getBoolean("enabled"))
+
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                assertEquals("PROPFIND", request.method)
+                return MockResponse().setResponseCode(207).setHeader("Content-Type", "application/xml").setBody(
+                    """<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"><D:response><D:href>/dav/backups/backup.json</D:href><D:propstat><D:prop><D:getlastmodified>Wed, 05 Aug 2026 03:00:00 GMT</D:getlastmodified><D:getcontentlength>42</D:getcontentlength></D:prop></D:propstat></D:response></D:multistatus>""",
+                )
+            }
+        }
+        server.start()
+
+        val versions = WebDavBackup.list(server.url("/dav/backups/").toString(), "user", "password")
+
+        assertEquals(1, versions.size)
+        assertEquals("backup.json", versions.single().fileName)
+    }
+
+    @Test
+    fun cloudDailyTrafficWinsAfterReinstallButNeverOverwritesNewerLocalValues() {
+        assertEquals(9_000L to 7, mergeDailyTrafficWithCloud(0L, 0, 9_000L, 7L))
+        assertEquals(12_000L to 8, mergeDailyTrafficWithCloud(12_000L, 8, 9_000L, 7L))
+    }
+
+    @Test
     fun s3ListsAllPagesAndRestoresSelectedObject() = runBlocking {
         var uploadedKey = ""
         var uploadedJson = ""
