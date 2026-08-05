@@ -113,12 +113,20 @@ object CloudApi {
             JSONObject().put("email", email).put("code", code).put("newPassword", newPassword),
         )
 
-    suspend fun syncTraffic(session: CloudSession, consumedBytes: Long, taskCount: Long) {
+    suspend fun syncTraffic(
+        session: CloudSession,
+        consumedBytes: Long,
+        taskCount: Long,
+        installationId: String,
+    ) {
         requestJson(
             session,
             "POST",
             "/v1/traffic/sync",
-            JSONObject().put("consumedBytes", consumedBytes).put("taskCount", taskCount),
+            JSONObject()
+                .put("consumedBytes", consumedBytes)
+                .put("taskCount", taskCount)
+                .put("installationId", installationId),
         )
     }
 

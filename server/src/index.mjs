@@ -323,16 +323,63 @@ app.post("/v1/traffic/sync", requireUser, async (request, response, next) => {
     if (consumedBytes === null || !Number.isSafeInteger(taskCount) || taskCount < 0 || taskCount > 1_000_000) {
       return response.status(400).json({ error: "统计数据无效" });
     }
-    await pool.execute(
-      `INSERT INTO traffic_daily
-        (user_id, stat_date, stat_year, stat_month, stat_day, consumed_bytes, task_count)
-       VALUES (?, CURRENT_DATE, YEAR(CURRENT_DATE), MONTH(CURRENT_DATE), DAY(CURRENT_DATE), ?, ?)
-       ON DUPLICATE KEY UPDATE
-         consumed_bytes = GREATEST(consumed_bytes, VALUES(consumed_bytes)),
-         task_count = GREATEST(task_count, VALUES(task_count))`,
-      [Number(request.user.sub), consumedBytes, taskCount],
-    );
-    response.json({ ok: true });
+    const installationId = String(request.body?.installationId || "").trim();
+    if (installationId && !/^[a-f0-9-]{36}$/i.test(installationId)) {
+      return response.status(400).json({ error: "设备标识无效" });
+    }
+    if (!installationId) {
+      // Older app versions send one account-wide absolute total.
+      await pool.execute(
+        `INSERT INTO traffic_daily
+          (user_id, stat_date, stat_year, stat_month, stat_day, consumed_bytes, task_count)
+         VALUES (?, CURRENT_DATE, YEAR(CURRENT_DATE), MONTH(CURRENT_DATE), DAY(CURRENT_DATE), ?, ?)
+         ON DUPLICATE KEY UPDATE
+           consumed_bytes = GREATEST(consumed_bytes, VALUES(consumed_bytes)),
+           task_count = GREATEST(task_count, VALUES(task_count))`,
+        [Number(request.user.sub), consumedBytes, taskCount],
+      );
+      return response.json({ ok: true });
+    }
+
+    const connection = await pool.getConnection();
+    try {
+      await connection.beginTransaction();
+      const [existing] = await connection.execute(
+        `SELECT consumed_bytes, task_count FROM traffic_device_daily
+         WHERE user_id = ? AND installation_id = ? AND stat_date = CURRENT_DATE FOR UPDATE`,
+        [Number(request.user.sub), installationId],
+      );
+      const previous = existing[0] || { consumed_bytes: 0, task_count: 0 };
+      const nextBytes = Math.max(Number(previous.consumed_bytes), consumedBytes);
+      const nextTasks = Math.max(Number(previous.task_count), taskCount);
+      const addedBytes = nextBytes - Number(previous.consumed_bytes);
+      const addedTasks = nextTasks - Number(previous.task_count);
+
+      await connection.execute(
+        `INSERT INTO traffic_device_daily (user_id, installation_id, stat_date, consumed_bytes, task_count)
+         VALUES (?, ?, CURRENT_DATE, ?, ?)
+         ON DUPLICATE KEY UPDATE consumed_bytes = VALUES(consumed_bytes), task_count = VALUES(task_count)`,
+        [Number(request.user.sub), installationId, nextBytes, nextTasks],
+      );
+      if (addedBytes || addedTasks) {
+        await connection.execute(
+          `INSERT INTO traffic_daily
+            (user_id, stat_date, stat_year, stat_month, stat_day, consumed_bytes, task_count)
+           VALUES (?, CURRENT_DATE, YEAR(CURRENT_DATE), MONTH(CURRENT_DATE), DAY(CURRENT_DATE), ?, ?)
+           ON DUPLICATE KEY UPDATE
+             consumed_bytes = consumed_bytes + VALUES(consumed_bytes),
+             task_count = task_count + VALUES(task_count)`,
+          [Number(request.user.sub), addedBytes, addedTasks],
+        );
+      }
+      await connection.commit();
+      response.json({ ok: true, addedBytes, addedTasks });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
   } catch (error) {
     next(error);
   }

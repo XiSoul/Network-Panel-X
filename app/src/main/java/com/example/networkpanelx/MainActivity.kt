@@ -117,6 +117,7 @@ import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
@@ -136,6 +137,8 @@ private const val PREF_PROGRESS_NOTIFICATION = "progress_notification"
 private const val PREF_DAILY_TRAFFIC_DATE = "daily_traffic_date"
 private const val PREF_DAILY_TRAFFIC_BYTES = "daily_traffic_bytes"
 private const val PREF_DAILY_TASK_COUNT = "daily_task_count"
+private const val PREF_CLOUD_INSTALLATION_ID = "cloud_installation_id"
+private const val PREF_CLOUD_DEVICE_CONTRIBUTION_PREFIX = "cloud_device_contribution_"
 private const val LEGACY_ANDROID_APP_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; Network-Panel-X Build/UP1A.231005.007)"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
@@ -161,6 +164,91 @@ data class SavedUserAgent(
     val value: String,
     val builtIn: Boolean = false,
 )
+
+internal data class DeviceTrafficContribution(
+    val consumedBytes: Long,
+    val taskCount: Long,
+)
+
+internal fun inferDeviceTrafficContribution(
+    localBytes: Long,
+    localTasks: Int,
+    cloudBytes: Long,
+    cloudTasks: Long,
+): DeviceTrafficContribution {
+    fun infer(local: Long, cloud: Long): Long = when {
+        local <= 0L -> 0L
+        local < cloud -> local
+        local == cloud -> 0L
+        else -> local - cloud
+    }
+
+    return DeviceTrafficContribution(
+        consumedBytes = infer(localBytes.coerceAtLeast(0L), cloudBytes.coerceAtLeast(0L)),
+        taskCount = infer(localTasks.toLong().coerceAtLeast(0L), cloudTasks.coerceAtLeast(0L)),
+    )
+}
+
+private class DeviceTrafficContributionStore(context: Context) {
+    private val preferences = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    fun installationId(): String {
+        val existing = preferences.getString(PREF_CLOUD_INSTALLATION_ID, null)
+        if (!existing.isNullOrBlank()) return existing
+        return UUID.randomUUID().toString().also {
+            preferences.edit().putString(PREF_CLOUD_INSTALLATION_ID, it).apply()
+        }
+    }
+
+    fun contributionForSync(
+        session: CloudSession,
+        date: String,
+        localBytes: Long,
+        localTasks: Int,
+        cloudBytes: Long,
+        cloudTasks: Long,
+    ): DeviceTrafficContribution {
+        load(session, date)?.let { return it }
+        return inferDeviceTrafficContribution(localBytes, localTasks, cloudBytes, cloudTasks)
+            .also { save(session, date, it) }
+    }
+
+    fun recordLocalTraffic(session: CloudSession, date: String, bytes: Long, tasks: Int) {
+        if (bytes <= 0L && tasks <= 0) return
+        val existing = load(session, date) ?: DeviceTrafficContribution(0L, 0L)
+        save(
+            session,
+            date,
+            DeviceTrafficContribution(
+                consumedBytes = (existing.consumedBytes + bytes.coerceAtLeast(0L)).coerceAtLeast(existing.consumedBytes),
+                taskCount = (existing.taskCount + tasks.coerceAtLeast(0)).coerceAtLeast(existing.taskCount),
+            ),
+        )
+    }
+
+    private fun load(session: CloudSession, date: String): DeviceTrafficContribution? {
+        val key = key(session)
+        if (preferences.getString("${key}_date", null) != date) return null
+        return DeviceTrafficContribution(
+            consumedBytes = preferences.getLong("${key}_bytes", 0L).coerceAtLeast(0L),
+            taskCount = preferences.getLong("${key}_tasks", 0L).coerceAtLeast(0L),
+        )
+    }
+
+    private fun save(session: CloudSession, date: String, contribution: DeviceTrafficContribution) {
+        val key = key(session)
+        preferences.edit()
+            .putString("${key}_date", date)
+            .putLong("${key}_bytes", contribution.consumedBytes.coerceAtLeast(0L))
+            .putLong("${key}_tasks", contribution.taskCount.coerceAtLeast(0L))
+            .apply()
+    }
+
+    private fun key(session: CloudSession): String {
+        val scope = "${session.apiBaseUrl.trimEnd('/').lowercase()}\u0000${session.username.lowercase()}"
+        return PREF_CLOUD_DEVICE_CONTRIBUTION_PREFIX + UUID.nameUUIDFromBytes(scope.toByteArray()).toString()
+    }
+}
 
 data class ReleaseInfo(
     val version: String,
@@ -369,6 +457,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     private val cloudSessionStore = CloudSessionStore(app)
     private var cloudSession: CloudSession? = cloudSessionStore.load()
+    private val deviceTrafficContributionStore = DeviceTrafficContributionStore(app)
     private val backupConnectionStore = BackupConnectionStore(app)
     var backupConnection by mutableStateOf(backupConnectionStore.load())
         private set
@@ -669,12 +758,27 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         statsLoading = true
         viewModelScope.launch {
             runCatching {
-                CloudApi.syncTraffic(session, dailyTrafficBytes, dailyTaskCount.toLong())
-                CloudApi.personalStats(session, period) to CloudApi.leaderboard(session, period)
-            }.onSuccess { (stats, entries) ->
-                if (period == "day") {
-                    restoreDailyTrafficFromCloud(stats)
-                }
+                val today = LocalDate.now().toString()
+                val cloudDayBeforeSync = CloudApi.personalStats(session, "day")
+                val contribution = deviceTrafficContributionStore.contributionForSync(
+                    session = session,
+                    date = today,
+                    localBytes = dailyTrafficBytes,
+                    localTasks = dailyTaskCount,
+                    cloudBytes = cloudDayBeforeSync.consumedBytes,
+                    cloudTasks = cloudDayBeforeSync.taskCount,
+                )
+                CloudApi.syncTraffic(
+                    session = session,
+                    consumedBytes = contribution.consumedBytes,
+                    taskCount = contribution.taskCount,
+                    installationId = deviceTrafficContributionStore.installationId(),
+                )
+                val cloudDayAfterSync = CloudApi.personalStats(session, "day")
+                val selectedStats = if (period == "day") cloudDayAfterSync else CloudApi.personalStats(session, period)
+                Triple(cloudDayAfterSync, selectedStats, CloudApi.leaderboard(session, period))
+            }.onSuccess { (cloudDay, stats, entries) ->
+                restoreDailyTrafficFromCloud(cloudDay)
                 personalStats = stats
                 leaderboardEntries = entries
                 cloudStatus = "已同步${stats.period}统计"
@@ -1606,6 +1710,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
         dailyTrafficBytes += bytes
         persistDailyTraffic(today, dailyTrafficBytes, dailyTaskCount)
+        cloudSession?.let { session ->
+            deviceTrafficContributionStore.recordLocalTraffic(session, today, bytes, 0)
+        }
     }
 
     private fun addDailyTaskCount(count: Int) {
@@ -1618,6 +1725,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
         dailyTaskCount += count
         persistDailyTraffic(today, dailyTrafficBytes, dailyTaskCount)
+        cloudSession?.let { session ->
+            deviceTrafficContributionStore.recordLocalTraffic(session, today, 0L, count)
+        }
     }
 
     private fun persistDailyTraffic(date: String, bytes: Long, taskCount: Int) {

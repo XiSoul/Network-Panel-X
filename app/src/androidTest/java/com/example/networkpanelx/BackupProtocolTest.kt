@@ -104,6 +104,25 @@ class BackupProtocolTest {
     }
 
     @Test
+    fun deviceContributionSyncsOnlyTrafficProducedAfterCloudTotalWasRestored() {
+        val cloudTotal = 3_220L
+        val newLocalTraffic = 200L
+
+        assertEquals(
+            DeviceTrafficContribution(newLocalTraffic, 1L),
+            inferDeviceTrafficContribution(cloudTotal + newLocalTraffic, 4, cloudTotal, 3),
+        )
+        assertEquals(
+            DeviceTrafficContribution(newLocalTraffic, 1L),
+            inferDeviceTrafficContribution(newLocalTraffic, 1, cloudTotal, 3),
+        )
+        assertEquals(
+            DeviceTrafficContribution(0L, 0L),
+            inferDeviceTrafficContribution(cloudTotal, 3, cloudTotal, 3),
+        )
+    }
+
+    @Test
     fun s3ListsAllPagesAndRestoresSelectedObject() = runBlocking {
         var uploadedKey = ""
         var uploadedJson = ""
