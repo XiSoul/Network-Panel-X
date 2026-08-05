@@ -39,6 +39,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.DropdownMenuItem
@@ -112,6 +113,7 @@ import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
+import java.time.Instant
 import java.time.LocalDate
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -341,6 +343,13 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     private val cloudSessionStore = CloudSessionStore(app)
     private var cloudSession: CloudSession? = cloudSessionStore.load()
+    private val backupConnectionStore = BackupConnectionStore(app)
+    var backupConnection by mutableStateOf(backupConnectionStore.load())
+        private set
+    var backupStatus by mutableStateOf("")
+        private set
+    var backupBusy by mutableStateOf(false)
+        private set
     var cloudUsername by mutableStateOf(cloudSession?.username.orEmpty())
         private set
     var cloudStatus by mutableStateOf(if (cloudSession != null) "已登录" else "未登录")
@@ -436,6 +445,130 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         cloudStatus = "未登录"
         personalStats = null
         leaderboardEntries = emptyList()
+    }
+
+    fun saveBackupConnection(connection: BackupConnection) {
+        backupConnection = connection
+        backupConnectionStore.save(connection)
+    }
+
+    fun uploadBackup(connection: BackupConnection) {
+        saveBackupConnection(connection)
+        backupBusy = true
+        backupStatus = "正在上传备份..."
+        viewModelScope.launch {
+            runCatching {
+                val document = createBackupDocument()
+                when (connection.provider) {
+                    "s3" -> S3Backup.upload(connection, document)
+                    else -> WebDavBackup.upload(connection.webDavUrl, connection.webDavUsername, connection.webDavPassword, document)
+                }
+            }.onSuccess { backupStatus = "备份上传成功" }
+                .onFailure { backupStatus = it.message ?: "备份上传失败" }
+            backupBusy = false
+        }
+    }
+
+    fun downloadBackup(connection: BackupConnection) {
+        saveBackupConnection(connection)
+        backupBusy = true
+        backupStatus = "正在下载备份..."
+        viewModelScope.launch {
+            runCatching {
+                when (connection.provider) {
+                    "s3" -> S3Backup.download(connection)
+                    else -> WebDavBackup.download(connection.webDavUrl, connection.webDavUsername, connection.webDavPassword)
+                }
+            }.onSuccess {
+                restoreBackupDocument(it)
+                backupStatus = "备份恢复成功"
+            }.onFailure { backupStatus = it.message ?: "备份下载失败" }
+            backupBusy = false
+        }
+    }
+
+    private fun createBackupDocument(): JSONObject {
+        val settings = JSONObject().apply {
+            put("threadCount", threadCount)
+            put("userAgent", userAgentText)
+            put("userAgents", JSONArray(serializeUserAgentOptions(userAgentOptions).toString()))
+            put("keepAlive", keepAliveEnabled)
+            put("keepScreenAwake", keepScreenAwakeEnabled)
+            put("progressNotification", progressNotificationEnabled)
+            put("themeDark", isDarkTheme)
+        }
+        val linkArray = JSONArray().apply {
+            links.forEach { link ->
+                put(JSONObject().apply {
+                    put("id", link.id)
+                    put("name", link.name)
+                    put("url", link.url)
+                    put("targetGbText", link.targetGbText)
+                    put("userAgent", link.userAgent)
+                    put("enabled", link.enabled)
+                })
+            }
+        }
+        return JSONObject().apply {
+            put("schemaVersion", 1)
+            put("appVersion", BuildConfig.VERSION_NAME)
+            put("createdAt", Instant.now().toString())
+            put("links", linkArray)
+            put("settings", settings)
+            put("dailyTraffic", JSONObject().apply {
+                val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
+                put("date", prefs.getString(PREF_DAILY_TRAFFIC_DATE, LocalDate.now().toString()))
+                put("bytes", dailyTrafficBytes)
+                put("taskCount", dailyTaskCount)
+            })
+        }
+    }
+
+    private fun restoreBackupDocument(document: JSONObject) {
+        require(document.optInt("schemaVersion", 0) == 1) { "不支持的备份版本" }
+        val restoredLinks = document.optJSONArray("links") ?: throw IllegalStateException("备份缺少链接配置")
+        val restored = buildList {
+            for (index in 0 until restoredLinks.length()) {
+                val item = restoredLinks.optJSONObject(index) ?: continue
+                add(LinkItem(
+                    id = index.toLong() + 1L,
+                    name = item.optString("name"),
+                    url = item.optString("url").trim(),
+                    targetGbText = item.optString("targetGbText"),
+                    userAgent = item.optString("userAgent"),
+                    enabled = item.optBoolean("enabled", true),
+                ))
+            }
+        }
+        links = restored
+        nextId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
+        val settings = document.optJSONObject("settings")
+        if (settings != null) {
+            threadCount = settings.optInt("threadCount", threadCount).coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
+            activeThreadCount = threadCount
+            userAgentText = settings.optString("userAgent", userAgentText).take(500)
+            userAgentOptions = loadUserAgentOptions(settings.optJSONArray("userAgents")?.toString())
+            keepAliveEnabled = settings.optBoolean("keepAlive", keepAliveEnabled)
+            keepScreenAwakeEnabled = settings.optBoolean("keepScreenAwake", keepScreenAwakeEnabled)
+            progressNotificationEnabled = settings.optBoolean("progressNotification", progressNotificationEnabled)
+            isDarkTheme = settings.optBoolean("themeDark", isDarkTheme)
+            persistSettings()
+            getApplication<Application>().getSharedPreferences(PREFS_NAME, 0).edit()
+                .putBoolean(PREF_THEME_DARK, isDarkTheme)
+                .apply()
+        }
+        val traffic = document.optJSONObject("dailyTraffic")
+        if (traffic != null) {
+            val today = LocalDate.now().toString()
+            val backupDate = traffic.optString("date", today)
+            persistDailyTraffic(
+                today,
+                if (backupDate == today) traffic.optLong("bytes", 0L).coerceAtLeast(0L) else 0L,
+                if (backupDate == today) traffic.optInt("taskCount", 0).coerceAtLeast(0) else 0,
+            )
+        }
+        persistLinks()
+        syncKeepAliveService()
     }
 
     fun refreshCloudStats(period: String) {
@@ -1803,8 +1936,159 @@ private fun SettingsPanel(vm: TrafficViewModel) {
         }
 
         item {
+            BackupPanel(vm)
+        }
+
+        item {
             UpdatePanel(vm = vm, context = context)
         }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun BackupPanel(vm: TrafficViewModel) {
+    val saved = vm.backupConnection
+    var provider by rememberSaveable { mutableStateOf(saved.provider) }
+    var webDavUrl by rememberSaveable { mutableStateOf(saved.webDavUrl) }
+    var webDavUsername by rememberSaveable { mutableStateOf(saved.webDavUsername) }
+    var webDavPassword by rememberSaveable { mutableStateOf(saved.webDavPassword) }
+    var s3Endpoint by rememberSaveable { mutableStateOf(saved.s3Endpoint) }
+    var s3Region by rememberSaveable { mutableStateOf(saved.s3Region) }
+    var s3Bucket by rememberSaveable { mutableStateOf(saved.s3Bucket) }
+    var s3AccessKey by rememberSaveable { mutableStateOf(saved.s3AccessKey) }
+    var s3SecretKey by rememberSaveable { mutableStateOf(saved.s3SecretKey) }
+    var s3ObjectPath by rememberSaveable { mutableStateOf(saved.s3ObjectPath) }
+    var showRestoreConfirm by remember { mutableStateOf(false) }
+
+    fun connection() = BackupConnection(
+        provider = provider,
+        webDavUrl = webDavUrl.trim(),
+        webDavUsername = webDavUsername.trim(),
+        webDavPassword = webDavPassword,
+        s3Endpoint = s3Endpoint.trim(),
+        s3Region = s3Region.trim(),
+        s3Bucket = s3Bucket.trim(),
+        s3AccessKey = s3AccessKey.trim(),
+        s3SecretKey = s3SecretKey,
+        s3ObjectPath = s3ObjectPath.trim(),
+    )
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("备份与恢复", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+            Text(
+                "备份链接、UA、测速设置和本机统计。备份文件不包含账号令牌或存储密钥。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(selected = provider == "webdav", onClick = { provider = "webdav" }, label = { Text("WebDAV") })
+                FilterChip(selected = provider == "s3", onClick = { provider = "s3" }, label = { Text("S3") })
+            }
+            if (provider == "webdav") {
+                OutlinedTextField(
+                    value = webDavUrl,
+                    onValueChange = { webDavUrl = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("WebDAV 文件地址") },
+                    placeholder = { Text("https://dav.example.com/network-panel-x.json") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = webDavUsername,
+                    onValueChange = { webDavUsername = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("WebDAV 用户名") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = webDavPassword,
+                    onValueChange = { webDavPassword = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("WebDAV 密码") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                )
+            } else {
+                OutlinedTextField(
+                    value = s3Endpoint,
+                    onValueChange = { s3Endpoint = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("S3 Endpoint") },
+                    placeholder = { Text("https://s3.amazonaws.com") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = s3Region,
+                    onValueChange = { s3Region = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("S3 Region") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = s3Bucket,
+                    onValueChange = { s3Bucket = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Bucket") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = s3AccessKey,
+                    onValueChange = { s3AccessKey = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Access Key") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = s3SecretKey,
+                    onValueChange = { s3SecretKey = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Secret Key") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = s3ObjectPath,
+                    onValueChange = { s3ObjectPath = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("对象路径") },
+                    singleLine = true,
+                )
+            }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Button(onClick = { vm.uploadBackup(connection()) }, enabled = !vm.backupBusy) {
+                    Text("上传备份")
+                }
+                Button(onClick = { showRestoreConfirm = true }, enabled = !vm.backupBusy) {
+                    Text("恢复备份")
+                }
+            }
+            if (vm.backupStatus.isNotBlank()) {
+                Text(vm.backupStatus, style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+
+    if (showRestoreConfirm) {
+        AlertDialog(
+            onDismissRequest = { showRestoreConfirm = false },
+            title = { Text("确认恢复备份？") },
+            text = { Text("恢复会覆盖当前链接、UA、测速设置和本机统计，云端账号不会改变。") },
+            confirmButton = {
+                Button(onClick = {
+                    showRestoreConfirm = false
+                    vm.downloadBackup(connection())
+                }) { Text("确认恢复") }
+            },
+            dismissButton = {
+                Button(onClick = { showRestoreConfirm = false }) { Text("取消") }
+            },
+        )
     }
 }
 

@@ -31,6 +31,7 @@ Before using login and rankings on a device, deploy `server/` to a public HTTPS 
 - Pause and resume traffic directly from the notification without opening the app.
 - Check GitHub Releases and open the project release list from **在线更新**.
 - Light/dark theme switching.
+- Optional WebDAV or S3-compatible backup and restore for links, User-Agent profiles, runtime settings, and today's local statistics.
 
 ## Settings
 
@@ -51,6 +52,11 @@ The **设置** tab provides runtime tuning options:
   - Each link can choose one saved UA in **链接管理**.
   - Empty per-link UA means the link follows the global UA.
   - If both per-link UA and global UA are empty, requests use an empty UA.
+- **Backup and restore**:
+  - WebDAV uses a complete remote JSON file URL plus Basic Auth credentials.
+  - S3 uses a service endpoint, region, bucket, access key, secret key, and object path. Path-style bucket access is used.
+  - Connection credentials are stored with Android encrypted preferences and are never included in backup documents.
+  - Restoring requires confirmation and replaces local links, User-Agent profiles, runtime settings, and today's local statistics. Cloud account sessions are not changed.
 
 ## Build
 

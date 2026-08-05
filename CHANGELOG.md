@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added TiDB-backed cloud accounts, daily/monthly/yearly personal statistics, and an all-user traffic leaderboard.
+- Added WebDAV backup and restore for links, User-Agent profiles, runtime settings, and today's local traffic statistics.
+- Added S3-compatible backup and restore using AWS Signature Version 4 with path-style bucket access.
+- Added encrypted local storage for WebDAV passwords and S3 access credentials.
+
+### Changed
+
+- Preconfigured the hosted cloud API address for new account sessions.
+- Backup files exclude cloud login tokens, account passwords, WebDAV passwords, and S3 secret keys.
+
 ## 1.0.7 - 2026-08-04
 
 ### Added
