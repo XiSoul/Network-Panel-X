@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.12 - 2026-08-05
+
+### Added
+
+- Added an automatic public local backup at `Download/Network Panel X/network-panel-x.json`. The folder and initial JSON are created on first app launch, then links and runtime settings update the same file.
+- Added **导入本地 JSON** in **链接管理** for recovering the public local backup after an uninstall or cleared app data.
+
 ## 1.0.11 - 2026-08-05
 
 ### Added

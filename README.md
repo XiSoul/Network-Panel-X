@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.11`
+Current version: `1.0.12`
 
 ## Cloud Accounts And Rankings
 
@@ -36,6 +36,8 @@ Before using login and rankings on a device, deploy `server/` to a public Node h
 - Ranking synchronization records each app installation separately, so newly generated local traffic is added to the cloud total without re-uploading traffic restored from another device.
 - While a traffic task is running, ranking and the account JSON snapshot sync automatically every 5 minutes. Manual ranking sync has a 60-second cooldown.
 - The cloud account stores one current JSON snapshot of links, UA profiles, runtime settings, and today's local statistics. When a reinstalled app logs in with no local links, it restores that snapshot automatically.
+- The app also writes a local JSON backup automatically to `Download/Network Panel X/network-panel-x.json`, which is visible in standard file managers and remains after an uninstall.
+- After an uninstall or an app-data clear, use **链接管理** -> **导入本地 JSON** to select that file. Android scoped storage does not allow a newly installed app to silently reopen the previous installation's public download.
 
 ## Settings
 

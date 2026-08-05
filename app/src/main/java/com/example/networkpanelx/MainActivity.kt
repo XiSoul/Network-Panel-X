@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -12,6 +13,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
+import android.provider.MediaStore
 import com.google.android.gms.net.CronetProviderInstaller
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -141,6 +143,9 @@ private const val PREF_CLOUD_INSTALLATION_ID = "cloud_installation_id"
 private const val PREF_CLOUD_DEVICE_CONTRIBUTION_PREFIX = "cloud_device_contribution_"
 private const val AUTO_CLOUD_SYNC_INTERVAL_MS = 5 * 60 * 1000L
 private const val MANUAL_CLOUD_SYNC_COOLDOWN_SECONDS = 60
+private const val PUBLIC_BACKUP_FILE_NAME = "network-panel-x.json"
+private const val PUBLIC_BACKUP_RELATIVE_PATH = "Download/Network Panel X/"
+private const val PREF_PUBLIC_BACKUP_URI = "public_backup_uri"
 private const val LEGACY_ANDROID_APP_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; Network-Panel-X Build/UP1A.231005.007)"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
@@ -255,6 +260,37 @@ private class DeviceTrafficContributionStore(context: Context) {
     private fun key(session: CloudSession): String {
         val scope = "${session.apiBaseUrl.trimEnd('/').lowercase()}\u0000${session.username.lowercase()}"
         return PREF_CLOUD_DEVICE_CONTRIBUTION_PREFIX + UUID.nameUUIDFromBytes(scope.toByteArray()).toString()
+    }
+}
+
+private object PublicJsonBackup {
+    fun write(context: Context, document: String) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        runCatching {
+            val resolver = context.contentResolver
+            val preferences = context.getSharedPreferences(PREFS_NAME, 0)
+            val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            val savedUri = preferences.getString(PREF_PUBLIC_BACKUP_URI, null)?.let(Uri::parse)
+            val isNewFile = savedUri == null
+            val uri = savedUri ?: resolver.insert(
+                collection,
+                ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, PUBLIC_BACKUP_FILE_NAME)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, PUBLIC_BACKUP_RELATIVE_PATH)
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                },
+            ) ?: throw IllegalStateException("无法创建公共 JSON 备份")
+            resolver.openOutputStream(uri, "wt")?.bufferedWriter(Charsets.UTF_8)?.use { it.write(document) }
+                ?: throw IllegalStateException("无法写入公共 JSON 备份")
+            if (isNewFile) {
+                resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            }
+            preferences.edit().putString(PREF_PUBLIC_BACKUP_URI, uri.toString()).apply()
+        }.onFailure {
+            context.getSharedPreferences(PREFS_NAME, 0).edit().remove(PREF_PUBLIC_BACKUP_URI).apply()
+            Log.w("NetworkPanelX", "写入公共 JSON 备份失败", it)
+        }
     }
 }
 
@@ -522,6 +558,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private var runJob: Job? = null
     private var autoCloudSyncJob: Job? = null
     private var manualSyncCooldownJob: Job? = null
+    private var publicBackupWriteJob: Job? = null
     private var selectedCloudStatsPeriod = "day"
     private var activeRunTargets: Map<Long, Long> = emptyMap()
     private val cronetConsecutiveFailures = AtomicLong(0L)
@@ -549,6 +586,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         nextId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
         TrafficNotificationCommandBus.register(this)
         if (keepAliveEnabled) syncKeepAliveService()
+        schedulePublicJsonBackup()
     }
 
     fun updateThreadCount(value: Int) {
@@ -689,6 +727,25 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 backupStatus = "备份恢复成功"
             }.onFailure { backupStatus = it.message ?: "备份下载失败" }
             backupBusy = false
+        }
+    }
+
+    fun importLocalJsonBackup(uri: Uri) {
+        if (isRunning) return
+        viewModelScope.launch {
+            runCatching {
+                val raw = withContext(Dispatchers.IO) {
+                    getApplication<Application>().contentResolver.openInputStream(uri)
+                        ?.bufferedReader(Charsets.UTF_8)
+                        ?.use { it.readText() }
+                        ?: throw IllegalStateException("无法读取 JSON 文件")
+                }
+                restoreBackupDocument(JSONObject(raw))
+            }.onSuccess {
+                statusText = "已从本地 JSON 恢复链接"
+            }.onFailure {
+                statusText = it.message ?: "本地 JSON 恢复失败"
+            }
         }
     }
 
@@ -1662,6 +1719,18 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             .edit()
             .putString(PREF_LINKS, array.toString())
             .apply()
+        schedulePublicJsonBackup()
+    }
+
+    private fun schedulePublicJsonBackup() {
+        val document = createBackupDocument().toString()
+        publicBackupWriteJob?.cancel()
+        publicBackupWriteJob = viewModelScope.launch {
+            delay(400)
+            withContext(Dispatchers.IO) {
+                PublicJsonBackup.write(getApplication(), document)
+            }
+        }
     }
 
     private fun loadLinks() {
@@ -1716,6 +1785,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             .putBoolean(PREF_KEEP_SCREEN_AWAKE, keepScreenAwakeEnabled)
             .putBoolean(PREF_PROGRESS_NOTIFICATION, progressNotificationEnabled)
             .apply()
+        schedulePublicJsonBackup()
     }
 
     private fun resolveTaskUserAgent(item: LinkItem): String? {
@@ -2913,6 +2983,11 @@ private fun LinkManagePanel(
     onQuickTrafficStarted: () -> Unit,
 ) {
     val expandedIds = rememberSaveable { mutableStateOf(setOf<Long>()) }
+    val localJsonImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        uri?.let(vm::importLocalJsonBackup)
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
@@ -2930,6 +3005,9 @@ private fun LinkManagePanel(
                 ) {
                     Button(onClick = { vm.addLink() }, enabled = !vm.isRunning) {
                         Text("新增链接")
+                    }
+                    Button(onClick = { localJsonImportLauncher.launch(arrayOf("application/json", "text/plain")) }, enabled = !vm.isRunning) {
+                        Text("导入本地 JSON")
                     }
                     Button(
                         onClick = {
