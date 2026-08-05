@@ -11,7 +11,7 @@
 
 ### Changed
 
-- Preconfigured the hosted cloud API address for new account sessions.
+- Built the hosted cloud API address into login and registration, removing the end-user API address field.
 - Backup files exclude cloud login tokens, account passwords, WebDAV passwords, and S3 secret keys.
 
 ## 1.0.7 - 2026-08-04

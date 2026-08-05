@@ -2095,7 +2095,6 @@ private fun BackupPanel(vm: TrafficViewModel) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CloudAccountPanel(vm: TrafficViewModel) {
-    var apiBaseUrl by rememberSaveable { mutableStateOf(DEFAULT_CLOUD_API_URL) }
     var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
 
@@ -2113,14 +2112,6 @@ private fun CloudAccountPanel(vm: TrafficViewModel) {
                 Text("已登录：${vm.cloudUsername}")
                 Button(onClick = vm::logoutCloudAccount) { Text("退出登录") }
             } else {
-                OutlinedTextField(
-                    value = apiBaseUrl,
-                    onValueChange = { apiBaseUrl = it.trim() },
-                    modifier = Modifier.fillMaxWidth(),
-                    label = { Text("云端 API 地址") },
-                    placeholder = { Text("https://api.example.com") },
-                    singleLine = true,
-                )
                 OutlinedTextField(
                     value = username,
                     onValueChange = { username = it.take(32) },
@@ -2141,8 +2132,8 @@ private fun CloudAccountPanel(vm: TrafficViewModel) {
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
-                    Button(onClick = { vm.loginCloudAccount(apiBaseUrl, username, password) }) { Text("登录") }
-                    Button(onClick = { vm.registerCloudAccount(apiBaseUrl, username, password) }) { Text("注册") }
+                    Button(onClick = { vm.loginCloudAccount(DEFAULT_CLOUD_API_URL, username, password) }) { Text("登录") }
+                    Button(onClick = { vm.registerCloudAccount(DEFAULT_CLOUD_API_URL, username, password) }) { Text("注册") }
                 }
             }
             Text(
