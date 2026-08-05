@@ -2,6 +2,7 @@ package com.example.networkpanelx
 
 import android.content.Context
 import android.util.Base64
+import android.util.Xml
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import kotlinx.coroutines.Dispatchers
@@ -13,13 +14,17 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URI
+import java.io.StringReader
 import java.security.MessageDigest
 import java.time.Instant
 import java.time.ZoneOffset
+import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.util.UUID
 import javax.crypto.Mac
 import javax.crypto.spec.SecretKeySpec
 import java.util.concurrent.TimeUnit
+import org.xmlpull.v1.XmlPullParser
 
 const val DEFAULT_CLOUD_API_URL = "http://39.98.88.224:50087"
 
@@ -165,27 +170,94 @@ object CloudApi {
     }
 }
 
+private const val BACKUP_FILE_PREFIX = "network-panel-x-"
+private const val BACKUP_FILE_SUFFIX = ".json"
+private val backupNameFormatter = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss-SSS").withZone(ZoneOffset.UTC)
+
+data class RemoteBackup(
+    val remoteId: String,
+    val fileName: String,
+    val modifiedAtEpochMs: Long,
+    val sizeBytes: Long,
+)
+
+private fun createBackupFileName(): String = "$BACKUP_FILE_PREFIX${backupNameFormatter.format(Instant.now())}-${UUID.randomUUID().toString().take(8)}$BACKUP_FILE_SUFFIX"
+private fun isBackupFile(name: String): Boolean = name.startsWith(BACKUP_FILE_PREFIX) && name.endsWith(BACKUP_FILE_SUFFIX)
+
 object WebDavBackup {
     private val client = OkHttpClient.Builder().connectTimeout(20, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).build()
     private val jsonMediaType = "application/json; charset=utf-8".toMediaType()
+    private val xmlMediaType = "application/xml; charset=utf-8".toMediaType()
 
-    suspend fun upload(url: String, username: String, password: String, document: JSONObject) = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url(url.trim())
+    suspend fun upload(directoryUrl: String, username: String, password: String, document: JSONObject): RemoteBackup = withContext(Dispatchers.IO) {
+        val directory = normalizeDirectoryUrl(directoryUrl)
+        val fileName = createBackupFileName()
+        val fileUrl = directory + fileName
+        val request = Request.Builder().url(fileUrl)
             .put(document.toString().toRequestBody(jsonMediaType))
             .header("Authorization", basicAuthorization(username, password))
             .build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) throw IllegalStateException("WebDAV 上传失败：${response.code}")
         }
+        RemoteBackup(fileUrl, fileName, System.currentTimeMillis(), document.toString().toByteArray().size.toLong())
     }
 
-    suspend fun download(url: String, username: String, password: String): JSONObject = withContext(Dispatchers.IO) {
-        val request = Request.Builder().url(url.trim()).header("Authorization", basicAuthorization(username, password)).build()
+    suspend fun list(directoryUrl: String, username: String, password: String): List<RemoteBackup> = withContext(Dispatchers.IO) {
+        val directory = normalizeDirectoryUrl(directoryUrl)
+        val propFindBody = """<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getlastmodified/><d:getcontentlength/><d:resourcetype/></d:prop></d:propfind>"""
+        val request = Request.Builder().url(directory)
+            .method("PROPFIND", propFindBody.toRequestBody(xmlMediaType))
+            .header("Authorization", basicAuthorization(username, password))
+            .header("Depth", "1")
+            .build()
+        client.newCall(request).execute().use { response ->
+            if (response.code != 207 && !response.isSuccessful) throw IllegalStateException("WebDAV 列表读取失败：${response.code}")
+            parseWebDavList(response.body?.string().orEmpty(), directory)
+        }
+    }
+
+    suspend fun download(remoteId: String, username: String, password: String): JSONObject = withContext(Dispatchers.IO) {
+        val request = Request.Builder().url(remoteId).header("Authorization", basicAuthorization(username, password)).build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) throw IllegalStateException("WebDAV 下载失败：${response.code}")
             JSONObject(response.body?.string().orEmpty())
         }
+    }
+
+    private fun normalizeDirectoryUrl(value: String): String {
+        val url = value.trim()
+        require(url.startsWith("https://") || url.startsWith("http://")) { "WebDAV 目录必须以 http:// 或 https:// 开头" }
+        return url.trimEnd('/') + "/"
+    }
+
+    private fun parseWebDavList(xml: String, directoryUrl: String): List<RemoteBackup> {
+        val parser = Xml.newPullParser().apply { setInput(StringReader(xml)) }
+        val backups = mutableListOf<RemoteBackup>()
+        var href = ""
+        var modifiedAt = 0L
+        var size = 0L
+        while (parser.eventType != XmlPullParser.END_DOCUMENT) {
+            when (parser.eventType) {
+                XmlPullParser.START_TAG -> when (parser.name.lowercase()) {
+                    "response" -> {
+                        href = ""
+                        modifiedAt = 0L
+                        size = 0L
+                    }
+                    "href" -> href = parser.nextText().trim()
+                    "getlastmodified" -> modifiedAt = parseRemoteTime(parser.nextText())
+                    "getcontentlength" -> size = parser.nextText().trim().toLongOrNull() ?: 0L
+                }
+                XmlPullParser.END_TAG -> if (parser.name.equals("response", ignoreCase = true) && href.isNotBlank()) {
+                    val resolved = URI(directoryUrl).resolve(href).toString()
+                    val fileName = URI(resolved).path.trimEnd('/').substringAfterLast('/')
+                    if (isBackupFile(fileName)) backups += RemoteBackup(resolved, fileName, modifiedAt, size)
+                }
+            }
+            parser.next()
+        }
+        return backups.sortedWith(compareByDescending<RemoteBackup> { it.modifiedAtEpochMs }.thenByDescending { it.fileName })
     }
 
     private fun basicAuthorization(username: String, password: String): String {
@@ -204,7 +276,7 @@ data class BackupConnection(
     val s3Bucket: String = "",
     val s3AccessKey: String = "",
     val s3SecretKey: String = "",
-    val s3ObjectPath: String = "network-panel-x/backup.json",
+    val s3ObjectPrefix: String = "network-panel-x",
 )
 
 class BackupConnectionStore(context: Context) {
@@ -226,7 +298,8 @@ class BackupConnectionStore(context: Context) {
         s3Bucket = preferences.getString("s3_bucket", "").orEmpty(),
         s3AccessKey = preferences.getString("s3_access_key", "").orEmpty(),
         s3SecretKey = preferences.getString("s3_secret_key", "").orEmpty(),
-        s3ObjectPath = preferences.getString("s3_object_path", "network-panel-x/backup.json").orEmpty(),
+        s3ObjectPrefix = preferences.getString("s3_object_prefix", null)
+            ?: preferences.getString("s3_object_path", "network-panel-x/backup.json").orEmpty().substringBeforeLast('/', "network-panel-x"),
     )
 
     fun save(connection: BackupConnection) {
@@ -240,7 +313,8 @@ class BackupConnectionStore(context: Context) {
             .putString("s3_bucket", connection.s3Bucket)
             .putString("s3_access_key", connection.s3AccessKey)
             .putString("s3_secret_key", connection.s3SecretKey)
-            .putString("s3_object_path", connection.s3ObjectPath)
+            .putString("s3_object_prefix", connection.s3ObjectPrefix)
+            .remove("s3_object_path")
             .apply()
     }
 }
@@ -250,20 +324,48 @@ object S3Backup {
     private val timestampFormatter = DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC)
     private val dateFormatter = DateTimeFormatter.ofPattern("yyyyMMdd").withZone(ZoneOffset.UTC)
 
-    suspend fun upload(connection: BackupConnection, document: JSONObject) = request(connection, "PUT", document.toString().toByteArray(Charsets.UTF_8))
+    suspend fun upload(connection: BackupConnection, document: JSONObject): RemoteBackup {
+        val fileName = createBackupFileName()
+        val key = joinPrefix(connection.s3ObjectPrefix, fileName)
+        val body = document.toString().toByteArray(Charsets.UTF_8)
+        request(connection, "PUT", key, emptyMap(), body)
+        return RemoteBackup(key, fileName, System.currentTimeMillis(), body.size.toLong())
+    }
 
-    suspend fun download(connection: BackupConnection): JSONObject = JSONObject(request(connection, "GET", null))
+    suspend fun list(connection: BackupConnection): List<RemoteBackup> {
+        val prefix = connection.s3ObjectPrefix.trim().trim('/').let { if (it.isBlank()) "" else "$it/" }
+        val backups = mutableListOf<RemoteBackup>()
+        var continuationToken: String? = null
+        do {
+            val query = linkedMapOf("list-type" to "2", "max-keys" to "1000", "prefix" to prefix).apply {
+                continuationToken?.let { put("continuation-token", it) }
+            }
+            val page = parseS3List(request(connection, "GET", null, query, null))
+            backups += page.first.filter { isBackupFile(it.fileName) }
+            continuationToken = page.second
+        } while (continuationToken != null && backups.size < 10_000)
+        return backups.sortedWith(compareByDescending<RemoteBackup> { it.modifiedAtEpochMs }.thenByDescending { it.fileName })
+    }
 
-    private suspend fun request(connection: BackupConnection, method: String, body: ByteArray?): String = withContext(Dispatchers.IO) {
+    suspend fun download(connection: BackupConnection, remoteId: String): JSONObject = JSONObject(request(connection, "GET", remoteId, emptyMap(), null))
+
+    private suspend fun request(
+        connection: BackupConnection,
+        method: String,
+        objectKey: String?,
+        query: Map<String, String>,
+        body: ByteArray?,
+    ): String = withContext(Dispatchers.IO) {
         val endpoint = URI(connection.s3Endpoint.trim().trimEnd('/'))
         require(endpoint.scheme == "http" || endpoint.scheme == "https") { "S3 Endpoint 必须以 http:// 或 https:// 开头" }
         require(endpoint.host.isNullOrBlank().not()) { "S3 Endpoint 无效" }
         require(connection.s3Region.isNotBlank() && connection.s3Bucket.isNotBlank()) { "请填写 S3 区域和存储桶" }
         require(connection.s3AccessKey.isNotBlank() && connection.s3SecretKey.isNotBlank()) { "请填写 S3 Access Key 和 Secret Key" }
-        val objectPath = connection.s3ObjectPath.trim().trim('/').ifBlank { "network-panel-x/backup.json" }
         val basePath = endpoint.rawPath.orEmpty().trimEnd('/')
-        val encodedPath = "/${percentEncode(connection.s3Bucket)}/${objectPath.split('/').filter { it.isNotBlank() }.joinToString("/") { percentEncode(it) }}"
+        val encodedKey = objectKey?.split('/')?.filter { it.isNotBlank() }?.joinToString("/") { percentEncode(it) }.orEmpty()
+        val encodedPath = "/${percentEncode(connection.s3Bucket)}" + if (encodedKey.isBlank()) "" else "/$encodedKey"
         val canonicalUri = if (basePath.isBlank()) encodedPath else "$basePath$encodedPath"
+        val canonicalQuery = query.entries.sortedBy { it.key }.joinToString("&") { "${percentEncode(it.key)}=${percentEncode(it.value)}" }
         val host = endpoint.host + if (endpoint.port > 0) ":${endpoint.port}" else ""
         val now = Instant.now()
         val amzDate = timestampFormatter.format(now)
@@ -272,12 +374,12 @@ object S3Backup {
         val payloadHash = sha256Hex(payload)
         val canonicalHeaders = "host:$host\nx-amz-content-sha256:$payloadHash\nx-amz-date:$amzDate\n"
         val signedHeaders = "host;x-amz-content-sha256;x-amz-date"
-        val canonicalRequest = "$method\n$canonicalUri\n\n$canonicalHeaders\n$signedHeaders\n$payloadHash"
+        val canonicalRequest = "$method\n$canonicalUri\n$canonicalQuery\n$canonicalHeaders\n$signedHeaders\n$payloadHash"
         val scope = "$shortDate/${connection.s3Region}/s3/aws4_request"
         val stringToSign = "AWS4-HMAC-SHA256\n$amzDate\n$scope\n${sha256Hex(canonicalRequest.toByteArray(Charsets.UTF_8))}"
         val signingKey = hmac(hmac(hmac(hmac("AWS4${connection.s3SecretKey}".toByteArray(Charsets.UTF_8), shortDate), connection.s3Region), "s3"), "aws4_request")
         val signature = hmacHex(signingKey, stringToSign)
-        val url = "${endpoint.scheme}://$host$canonicalUri"
+        val url = "${endpoint.scheme}://$host$canonicalUri" + if (canonicalQuery.isBlank()) "" else "?$canonicalQuery"
         val requestBuilder = Request.Builder().url(url)
             .header("Host", host)
             .header("x-amz-date", amzDate)
@@ -286,10 +388,41 @@ object S3Backup {
         if (method == "PUT") requestBuilder.put(payload.toRequestBody("application/json; charset=utf-8".toMediaType())) else requestBuilder.get()
         client.newCall(requestBuilder.build()).execute().use { response ->
             val responseBody = response.body?.string().orEmpty()
-            if (!response.isSuccessful) throw IllegalStateException("S3 ${if (method == "PUT") "上传" else "下载"}失败：${response.code}")
+            if (!response.isSuccessful) throw IllegalStateException("S3 请求失败：${response.code}")
             responseBody
         }
     }
+
+    private fun parseS3List(xml: String): Pair<List<RemoteBackup>, String?> {
+        val parser = Xml.newPullParser().apply { setInput(StringReader(xml)) }
+        val backups = mutableListOf<RemoteBackup>()
+        var key = ""
+        var modifiedAt = 0L
+        var size = 0L
+        var nextToken: String? = null
+        while (parser.eventType != XmlPullParser.END_DOCUMENT) {
+            when (parser.eventType) {
+                XmlPullParser.START_TAG -> when (parser.name) {
+                    "Contents" -> {
+                        key = ""
+                        modifiedAt = 0L
+                        size = 0L
+                    }
+                    "Key" -> key = parser.nextText()
+                    "LastModified" -> modifiedAt = parseRemoteTime(parser.nextText())
+                    "Size" -> size = parser.nextText().toLongOrNull() ?: 0L
+                    "NextContinuationToken" -> nextToken = parser.nextText().ifBlank { null }
+                }
+                XmlPullParser.END_TAG -> if (parser.name == "Contents" && key.isNotBlank()) {
+                    backups += RemoteBackup(key, key.substringAfterLast('/'), modifiedAt, size)
+                }
+            }
+            parser.next()
+        }
+        return backups to nextToken
+    }
+
+    private fun joinPrefix(prefix: String, fileName: String): String = prefix.trim().trim('/').let { if (it.isBlank()) fileName else "$it/$fileName" }
 
     private fun percentEncode(value: String): String = buildString {
         value.toByteArray(Charsets.UTF_8).forEach { byte ->
@@ -304,3 +437,7 @@ object S3Backup {
     private fun hmac(key: ByteArray, value: String): ByteArray = Mac.getInstance("HmacSHA256").apply { init(SecretKeySpec(key, "HmacSHA256")) }.doFinal(value.toByteArray(Charsets.UTF_8))
     private fun hmacHex(key: ByteArray, value: String): String = hmac(key, value).joinToString("") { "%02x".format(it.toInt() and 0xff) }
 }
+
+private fun parseRemoteTime(value: String): Long = runCatching { Instant.parse(value.trim()).toEpochMilli() }
+    .recoverCatching { ZonedDateTime.parse(value.trim(), DateTimeFormatter.RFC_1123_DATE_TIME).toInstant().toEpochMilli() }
+    .getOrDefault(0L)

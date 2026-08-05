@@ -115,6 +115,8 @@ import java.net.URL
 import java.nio.ByteBuffer
 import java.time.Instant
 import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.TimeUnit
@@ -306,6 +308,7 @@ object TrafficNotificationCommandBus {
 class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val TAG = "TrafficViewModel"
+        private const val BACKUP_PAGE_SIZE = 10
     }
 
     var links by mutableStateOf(emptyList<LinkItem>())
@@ -350,6 +353,14 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var backupBusy by mutableStateOf(false)
         private set
+    var remoteBackups by mutableStateOf(emptyList<RemoteBackup>())
+        private set
+    var backupPage by mutableIntStateOf(0)
+        private set
+    val backupPageCount: Int
+        get() = ((remoteBackups.size + BACKUP_PAGE_SIZE - 1) / BACKUP_PAGE_SIZE).coerceAtLeast(1)
+    val backupPageItems: List<RemoteBackup>
+        get() = remoteBackups.drop(backupPage * BACKUP_PAGE_SIZE).take(BACKUP_PAGE_SIZE)
     var cloudUsername by mutableStateOf(cloudSession?.username.orEmpty())
         private set
     var cloudStatus by mutableStateOf(if (cloudSession != null) "已登录" else "未登录")
@@ -463,21 +474,60 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                     "s3" -> S3Backup.upload(connection, document)
                     else -> WebDavBackup.upload(connection.webDavUrl, connection.webDavUsername, connection.webDavPassword, document)
                 }
-            }.onSuccess { backupStatus = "备份上传成功" }
-                .onFailure { backupStatus = it.message ?: "备份上传失败" }
+            }.onSuccess {
+                backupStatus = "新备份上传成功"
+                backupBusy = false
+                refreshBackupList(connection)
+            }
+                .onFailure {
+                    backupStatus = it.message ?: "备份上传失败"
+                    backupBusy = false
+                }
+        }
+    }
+
+    fun refreshBackupList(connection: BackupConnection) {
+        saveBackupConnection(connection)
+        backupBusy = true
+        backupStatus = "正在读取在线备份..."
+        viewModelScope.launch {
+            runCatching {
+                when (connection.provider) {
+                    "s3" -> S3Backup.list(connection)
+                    else -> WebDavBackup.list(connection.webDavUrl, connection.webDavUsername, connection.webDavPassword)
+                }
+            }.onSuccess {
+                remoteBackups = it
+                backupPage = 0
+                backupStatus = if (it.isEmpty()) "目录中没有备份" else "已读取 ${it.size} 个在线备份"
+            }.onFailure { backupStatus = it.message ?: "在线备份读取失败" }
             backupBusy = false
         }
     }
 
-    fun downloadBackup(connection: BackupConnection) {
+    fun previousBackupPage() {
+        backupPage = (backupPage - 1).coerceAtLeast(0)
+    }
+
+    fun nextBackupPage() {
+        backupPage = (backupPage + 1).coerceAtMost(backupPageCount - 1)
+    }
+
+    fun clearBackupList() {
+        remoteBackups = emptyList()
+        backupPage = 0
+        backupStatus = ""
+    }
+
+    fun downloadBackup(connection: BackupConnection, backup: RemoteBackup) {
         saveBackupConnection(connection)
         backupBusy = true
-        backupStatus = "正在下载备份..."
+        backupStatus = "正在恢复 ${backup.fileName}..."
         viewModelScope.launch {
             runCatching {
                 when (connection.provider) {
-                    "s3" -> S3Backup.download(connection)
-                    else -> WebDavBackup.download(connection.webDavUrl, connection.webDavUsername, connection.webDavPassword)
+                    "s3" -> S3Backup.download(connection, backup.remoteId)
+                    else -> WebDavBackup.download(backup.remoteId, connection.webDavUsername, connection.webDavPassword)
                 }
             }.onSuccess {
                 restoreBackupDocument(it)
@@ -1958,8 +2008,8 @@ private fun BackupPanel(vm: TrafficViewModel) {
     var s3Bucket by rememberSaveable { mutableStateOf(saved.s3Bucket) }
     var s3AccessKey by rememberSaveable { mutableStateOf(saved.s3AccessKey) }
     var s3SecretKey by rememberSaveable { mutableStateOf(saved.s3SecretKey) }
-    var s3ObjectPath by rememberSaveable { mutableStateOf(saved.s3ObjectPath) }
-    var showRestoreConfirm by remember { mutableStateOf(false) }
+    var s3ObjectPrefix by rememberSaveable { mutableStateOf(saved.s3ObjectPrefix) }
+    var selectedBackup by remember { mutableStateOf<RemoteBackup?>(null) }
 
     fun connection() = BackupConnection(
         provider = provider,
@@ -1971,7 +2021,7 @@ private fun BackupPanel(vm: TrafficViewModel) {
         s3Bucket = s3Bucket.trim(),
         s3AccessKey = s3AccessKey.trim(),
         s3SecretKey = s3SecretKey,
-        s3ObjectPath = s3ObjectPath.trim(),
+        s3ObjectPrefix = s3ObjectPrefix.trim(),
     )
 
     Card(
@@ -1982,21 +2032,29 @@ private fun BackupPanel(vm: TrafficViewModel) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("备份与恢复", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
             Text(
-                "备份链接、UA、测速设置和本机统计。备份文件不包含账号令牌或存储密钥。",
+                "每次上传会在远端目录新增一个带时间戳的版本；在线列表按时间倒序分页显示。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
             )
             FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                FilterChip(selected = provider == "webdav", onClick = { provider = "webdav" }, label = { Text("WebDAV") })
-                FilterChip(selected = provider == "s3", onClick = { provider = "s3" }, label = { Text("S3") })
+                FilterChip(
+                    selected = provider == "webdav",
+                    onClick = { provider = "webdav"; vm.clearBackupList() },
+                    label = { Text("WebDAV") },
+                )
+                FilterChip(
+                    selected = provider == "s3",
+                    onClick = { provider = "s3"; vm.clearBackupList() },
+                    label = { Text("S3") },
+                )
             }
             if (provider == "webdav") {
                 OutlinedTextField(
                     value = webDavUrl,
                     onValueChange = { webDavUrl = it },
                     modifier = Modifier.fillMaxWidth(),
-                    label = { Text("WebDAV 文件地址") },
-                    placeholder = { Text("https://dav.example.com/network-panel-x.json") },
+                    label = { Text("WebDAV 备份目录") },
+                    placeholder = { Text("https://dav.example.com/backups/") },
                     singleLine = true,
                 )
                 OutlinedTextField(
@@ -2053,43 +2111,86 @@ private fun BackupPanel(vm: TrafficViewModel) {
                     singleLine = true,
                 )
                 OutlinedTextField(
-                    value = s3ObjectPath,
-                    onValueChange = { s3ObjectPath = it },
+                    value = s3ObjectPrefix,
+                    onValueChange = { s3ObjectPrefix = it },
                     modifier = Modifier.fillMaxWidth(),
-                    label = { Text("对象路径") },
+                    label = { Text("对象前缀（文件夹）") },
+                    placeholder = { Text("network-panel-x") },
                     singleLine = true,
                 )
             }
             FlowRow(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 Button(onClick = { vm.uploadBackup(connection()) }, enabled = !vm.backupBusy) {
-                    Text("上传备份")
+                    Text("上传新备份")
                 }
-                Button(onClick = { showRestoreConfirm = true }, enabled = !vm.backupBusy) {
-                    Text("恢复备份")
+                Button(onClick = { vm.refreshBackupList(connection()) }, enabled = !vm.backupBusy) {
+                    Text("刷新在线列表")
                 }
             }
             if (vm.backupStatus.isNotBlank()) {
                 Text(vm.backupStatus, style = MaterialTheme.typography.bodySmall)
             }
+            vm.backupPageItems.forEach { backup ->
+                val isLatest = vm.remoteBackups.firstOrNull()?.remoteId == backup.remoteId
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(6.dp))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp),
+                ) {
+                    Text(
+                        if (isLatest) "最新 · ${backup.fileName}" else backup.fileName,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = if (isLatest) FontWeight.SemiBold else FontWeight.Normal,
+                    )
+                    Text(
+                        "${formatBackupTime(backup.modifiedAtEpochMs)} · ${formatBytes(backup.sizeBytes)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                    )
+                    Button(onClick = { selectedBackup = backup }, enabled = !vm.backupBusy) {
+                        Text("恢复这个版本")
+                    }
+                }
+            }
+            if (vm.remoteBackups.isNotEmpty()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Button(onClick = vm::previousBackupPage, enabled = vm.backupPage > 0 && !vm.backupBusy) { Text("上一页") }
+                    Text("${vm.backupPage + 1} / ${vm.backupPageCount}")
+                    Button(onClick = vm::nextBackupPage, enabled = vm.backupPage + 1 < vm.backupPageCount && !vm.backupBusy) { Text("下一页") }
+                }
+            }
         }
     }
 
-    if (showRestoreConfirm) {
+    selectedBackup?.let { backup ->
         AlertDialog(
-            onDismissRequest = { showRestoreConfirm = false },
+            onDismissRequest = { selectedBackup = null },
             title = { Text("确认恢复备份？") },
-            text = { Text("恢复会覆盖当前链接、UA、测速设置和本机统计，云端账号不会改变。") },
+            text = { Text("将恢复 ${backup.fileName}。当前链接、UA、测速设置和本机统计会被覆盖，云端账号不会改变。") },
             confirmButton = {
                 Button(onClick = {
-                    showRestoreConfirm = false
-                    vm.downloadBackup(connection())
+                    selectedBackup = null
+                    vm.downloadBackup(connection(), backup)
                 }) { Text("确认恢复") }
             },
             dismissButton = {
-                Button(onClick = { showRestoreConfirm = false }) { Text("取消") }
+                Button(onClick = { selectedBackup = null }) { Text("取消") }
             },
         )
     }
+}
+
+private fun formatBackupTime(epochMs: Long): String {
+    if (epochMs <= 0L) return "时间未知"
+    return Instant.ofEpochMilli(epochMs)
+        .atZone(ZoneId.systemDefault())
+        .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"))
 }
 
 @OptIn(ExperimentalLayoutApi::class)

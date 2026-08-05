@@ -5,8 +5,9 @@
 ### Added
 
 - Added TiDB-backed cloud accounts, daily/monthly/yearly personal statistics, and an all-user traffic leaderboard.
-- Added WebDAV backup and restore for links, User-Agent profiles, runtime settings, and today's local traffic statistics.
-- Added S3-compatible backup and restore using AWS Signature Version 4 with path-style bucket access.
+- Added versioned WebDAV backup and restore with directory listing through `PROPFIND`.
+- Added versioned S3-compatible backup and restore using AWS Signature Version 4 and `ListObjectsV2`.
+- Added an online backup browser sorted newest-first with 10 items per page and per-version restore confirmation.
 - Added encrypted local storage for WebDAV passwords and S3 access credentials.
 
 ### Changed

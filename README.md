@@ -53,8 +53,10 @@ The **设置** tab provides runtime tuning options:
   - Empty per-link UA means the link follows the global UA.
   - If both per-link UA and global UA are empty, requests use an empty UA.
 - **Backup and restore**:
-  - WebDAV uses a complete remote JSON file URL plus Basic Auth credentials.
-  - S3 uses a service endpoint, region, bucket, access key, secret key, and object path. Path-style bucket access is used.
+  - WebDAV uses a backup directory URL plus Basic Auth credentials. The directory must already exist.
+  - S3 uses a service endpoint, region, bucket, access key, secret key, and object prefix. Path-style bucket access is used.
+  - Every upload creates a new timestamped JSON file instead of overwriting one fixed object.
+  - The app reads the online WebDAV directory or S3 prefix, sorts versions newest first, and displays 10 versions per page. A selected version must be confirmed before restore.
   - Connection credentials are stored with Android encrypted preferences and are never included in backup documents.
   - Restoring requires confirmation and replaces local links, User-Agent profiles, runtime settings, and today's local statistics. Cloud account sessions are not changed.
 
