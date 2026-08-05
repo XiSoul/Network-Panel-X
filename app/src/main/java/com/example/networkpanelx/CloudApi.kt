@@ -130,6 +130,20 @@ object CloudApi {
         )
     }
 
+    suspend fun uploadProfileSnapshot(session: CloudSession, document: JSONObject) {
+        requestJson(
+            session,
+            "POST",
+            "/v1/profile/snapshot",
+            JSONObject().put("document", document),
+        )
+    }
+
+    suspend fun downloadProfileSnapshot(session: CloudSession): JSONObject? {
+        val json = requestJson(session, "GET", "/v1/profile/snapshot")
+        return json.optJSONObject("document")
+    }
+
     suspend fun personalStats(session: CloudSession, period: String): CloudTrafficStats {
         val json = requestJson(session, "GET", "/v1/stats/me?period=$period")
         return CloudTrafficStats(

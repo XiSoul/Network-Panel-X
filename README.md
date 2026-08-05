@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.10`
+Current version: `1.0.11`
 
 ## Cloud Accounts And Rankings
 
@@ -34,6 +34,8 @@ Before using login and rankings on a device, deploy `server/` to a public Node h
 - Optional WebDAV or S3-compatible backup and restore for links, User-Agent profiles, runtime settings, and today's local statistics.
 - Backup browser accepts both timestamped versions and legacy JSON backups; daily cloud traffic is restored locally after account login.
 - Ranking synchronization records each app installation separately, so newly generated local traffic is added to the cloud total without re-uploading traffic restored from another device.
+- While a traffic task is running, ranking and the account JSON snapshot sync automatically every 5 minutes. Manual ranking sync has a 60-second cooldown.
+- The cloud account stores one current JSON snapshot of links, UA profiles, runtime settings, and today's local statistics. When a reinstalled app logs in with no local links, it restores that snapshot automatically.
 
 ## Settings
 

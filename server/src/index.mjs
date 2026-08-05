@@ -316,6 +316,46 @@ app.get("/v1/me", requireUser, async (request, response) => {
   response.json({ id: Number(request.user.sub), username: request.user.username });
 });
 
+app.get("/v1/profile/snapshot", requireUser, async (request, response, next) => {
+  try {
+    const [rows] = await pool.execute(
+      "SELECT snapshot, updated_at AS updatedAt FROM user_profile_snapshots WHERE user_id = ? LIMIT 1",
+      [Number(request.user.sub)],
+    );
+    const snapshot = rows[0];
+    if (!snapshot) return response.json({ document: null });
+    const document = typeof snapshot.snapshot === "string" ? JSON.parse(snapshot.snapshot) : snapshot.snapshot;
+    response.json({ document, updatedAt: snapshot.updatedAt });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/v1/profile/snapshot", requireUser, async (request, response, next) => {
+  try {
+    const document = request.body?.document;
+    if (!document || typeof document !== "object" || Array.isArray(document)) {
+      return response.status(400).json({ error: "备份数据无效" });
+    }
+    if (Number(document.schemaVersion) !== 1 || !Array.isArray(document.links)) {
+      return response.status(400).json({ error: "备份格式不支持" });
+    }
+    const serialized = JSON.stringify(document);
+    if (Buffer.byteLength(serialized, "utf8") > 60 * 1024) {
+      return response.status(400).json({ error: "备份数据不能超过 60KB" });
+    }
+    await pool.execute(
+      `INSERT INTO user_profile_snapshots (user_id, snapshot)
+       VALUES (?, ?)
+       ON DUPLICATE KEY UPDATE snapshot = VALUES(snapshot), updated_at = CURRENT_TIMESTAMP(3)`,
+      [Number(request.user.sub), serialized],
+    );
+    response.json({ ok: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/v1/traffic/sync", requireUser, async (request, response, next) => {
   try {
     const consumedBytes = parseBytes(request.body?.consumedBytes);

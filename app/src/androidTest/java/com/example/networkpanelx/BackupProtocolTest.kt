@@ -123,6 +123,33 @@ class BackupProtocolTest {
     }
 
     @Test
+    fun cloudProfileSnapshotRoundTripsBackupDocument() = runBlocking {
+        var savedDocument = ""
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse = when {
+                request.method == "POST" && request.path == "/v1/profile/snapshot" -> {
+                    savedDocument = JSONObject(request.body.readUtf8()).getJSONObject("document").toString()
+                    MockResponse().setResponseCode(200).setBody("{\"ok\":true}")
+                }
+
+                request.method == "GET" && request.path == "/v1/profile/snapshot" -> {
+                    MockResponse().setResponseCode(200).setBody(JSONObject().put("document", JSONObject(savedDocument)).toString())
+                }
+
+                else -> MockResponse().setResponseCode(404)
+            }
+        }
+        server.start()
+        val session = CloudSession(server.url("/").toString().trimEnd('/'), "test_user", "token")
+        val document = JSONObject().put("schemaVersion", 1).put("links", org.json.JSONArray().put(JSONObject().put("url", "https://example.com/file")))
+
+        CloudApi.uploadProfileSnapshot(session, document)
+        val restored = CloudApi.downloadProfileSnapshot(session)
+
+        assertEquals("https://example.com/file", restored?.getJSONArray("links")?.getJSONObject(0)?.getString("url"))
+    }
+
+    @Test
     fun s3ListsAllPagesAndRestoresSelectedObject() = runBlocking {
         var uploadedKey = ""
         var uploadedJson = ""

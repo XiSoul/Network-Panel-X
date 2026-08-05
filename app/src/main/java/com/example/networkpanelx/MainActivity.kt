@@ -139,6 +139,8 @@ private const val PREF_DAILY_TRAFFIC_BYTES = "daily_traffic_bytes"
 private const val PREF_DAILY_TASK_COUNT = "daily_task_count"
 private const val PREF_CLOUD_INSTALLATION_ID = "cloud_installation_id"
 private const val PREF_CLOUD_DEVICE_CONTRIBUTION_PREFIX = "cloud_device_contribution_"
+private const val AUTO_CLOUD_SYNC_INTERVAL_MS = 5 * 60 * 1000L
+private const val MANUAL_CLOUD_SYNC_COOLDOWN_SECONDS = 60
 private const val LEGACY_ANDROID_APP_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; Network-Panel-X Build/UP1A.231005.007)"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
@@ -168,6 +170,12 @@ data class SavedUserAgent(
 internal data class DeviceTrafficContribution(
     val consumedBytes: Long,
     val taskCount: Long,
+)
+
+private data class CloudSyncResult(
+    val selectedStats: CloudTrafficStats,
+    val entries: List<LeaderboardEntry>,
+    val snapshotError: Throwable?,
 )
 
 internal fun inferDeviceTrafficContribution(
@@ -487,6 +495,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var statsLoading by mutableStateOf(false)
         private set
+    var manualSyncCooldownSeconds by mutableIntStateOf(0)
+        private set
+    val canManuallySyncCloudStats: Boolean
+        get() = !statsLoading && manualSyncCooldownSeconds == 0
 
     var currentTaskName by mutableStateOf("-")
         private set
@@ -508,6 +520,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     private var nextId = 1L
     private var runJob: Job? = null
+    private var autoCloudSyncJob: Job? = null
+    private var manualSyncCooldownJob: Job? = null
+    private var selectedCloudStatsPeriod = "day"
     private var activeRunTargets: Map<Long, Long> = emptyMap()
     private val cronetConsecutiveFailures = AtomicLong(0L)
     private var cronetTemporarilyDisabled = false
@@ -591,6 +606,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     fun logoutCloudAccount() {
         cloudSessionStore.clear()
         cloudSession = null
+        stopAutoCloudSync()
         cloudUsername = ""
         cloudStatus = "未登录"
         personalStats = null
@@ -750,10 +766,22 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         syncKeepAliveService()
     }
 
-    fun refreshCloudStats(period: String) {
+    fun refreshCloudStats(period: String, isManual: Boolean = true) {
         val session = cloudSession ?: run {
             cloudStatus = "请先登录云端账号"
             return
+        }
+        if (statsLoading) {
+            if (isManual) cloudStatus = "正在同步，请稍候"
+            return
+        }
+        if (isManual && manualSyncCooldownSeconds > 0) {
+            cloudStatus = "请在 ${manualSyncCooldownSeconds} 秒后再次同步"
+            return
+        }
+        if (isManual) {
+            selectedCloudStatsPeriod = period
+            startManualSyncCooldown()
         }
         statsLoading = true
         viewModelScope.launch {
@@ -776,15 +804,55 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 val cloudDayAfterSync = CloudApi.personalStats(session, "day")
                 val selectedStats = if (period == "day") cloudDayAfterSync else CloudApi.personalStats(session, period)
-                Triple(cloudDayAfterSync, selectedStats, CloudApi.leaderboard(session, period))
-            }.onSuccess { (cloudDay, stats, entries) ->
-                restoreDailyTrafficFromCloud(cloudDay)
-                personalStats = stats
-                leaderboardEntries = entries
-                cloudStatus = "已同步${stats.period}统计"
+                restoreDailyTrafficFromCloud(cloudDayAfterSync)
+                val snapshotError = runCatching {
+                    CloudApi.uploadProfileSnapshot(session, createBackupDocument())
+                }.exceptionOrNull()
+                CloudSyncResult(
+                    selectedStats = selectedStats,
+                    entries = CloudApi.leaderboard(session, period),
+                    snapshotError = snapshotError,
+                )
+            }.onSuccess { result ->
+                personalStats = result.selectedStats
+                leaderboardEntries = result.entries
+                cloudStatus = if (result.snapshotError == null) {
+                    "已同步${result.selectedStats.period}统计"
+                } else {
+                    "已同步${result.selectedStats.period}统计，链接备份稍后重试"
+                }
             }.onFailure { cloudStatus = it.message ?: "云端统计读取失败" }
             statsLoading = false
         }
+    }
+
+    private fun startManualSyncCooldown() {
+        manualSyncCooldownJob?.cancel()
+        manualSyncCooldownSeconds = MANUAL_CLOUD_SYNC_COOLDOWN_SECONDS
+        manualSyncCooldownJob = viewModelScope.launch {
+            while (manualSyncCooldownSeconds > 0) {
+                delay(1_000)
+                manualSyncCooldownSeconds -= 1
+            }
+        }
+    }
+
+    private fun startAutoCloudSync() {
+        autoCloudSyncJob?.cancel()
+        if (!isRunning || cloudSession == null) return
+        autoCloudSyncJob = viewModelScope.launch {
+            while (isActive && isRunning && cloudSession != null) {
+                delay(AUTO_CLOUD_SYNC_INTERVAL_MS)
+                if (isActive && isRunning && cloudSession != null) {
+                    refreshCloudStats(selectedCloudStatsPeriod, isManual = false)
+                }
+            }
+        }
+    }
+
+    private fun stopAutoCloudSync() {
+        autoCloudSyncJob?.cancel()
+        autoCloudSyncJob = null
     }
 
     private fun restoreDailyTrafficFromCloud(stats: CloudTrafficStats) {
@@ -802,13 +870,22 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private fun authenticateCloudAccount(action: suspend () -> CloudSession) {
         viewModelScope.launch {
             cloudStatus = "正在校验账号..."
-            runCatching { action() }.onSuccess { session ->
+            try {
+                val session = action()
                 cloudSessionStore.save(session)
                 cloudSession = session
                 cloudUsername = session.username
+                if (links.isEmpty()) {
+                    runCatching { CloudApi.downloadProfileSnapshot(session) }
+                        .getOrNull()
+                        ?.let(::restoreBackupDocument)
+                }
                 cloudStatus = "登录成功"
-                refreshCloudStats("day")
-            }.onFailure { cloudStatus = it.message ?: "登录失败" }
+                refreshCloudStats("day", isManual = false)
+                startAutoCloudSync()
+            } catch (error: Throwable) {
+                cloudStatus = error.message ?: "登录失败"
+            }
         }
     }
 
@@ -1005,6 +1082,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         runJob?.cancel()
         runJob = null
         isRunning = false
+        stopAutoCloudSync()
         statusText = "已暂停"
         currentSpeedBytesPerSec = 0L
         cronetConsecutiveFailures.set(0L)
@@ -1105,6 +1183,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         addDailyTaskCount(parsed.size)
         statusText = initialStatusText
         syncKeepAliveService()
+        startAutoCloudSync()
 
         runJob = viewModelScope.launch(Dispatchers.IO) {
             for ((index, task) in parsed.withIndex()) {
@@ -1139,6 +1218,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         statusText = "链接失败：${e.message ?: "未知错误"}"
                         isRunning = false
+                        stopAutoCloudSync()
                         currentSpeedBytesPerSec = 0L
                         syncKeepAliveService()
                     }
@@ -1148,6 +1228,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
             withContext(Dispatchers.Main) {
                 isRunning = false
+                stopAutoCloudSync()
                 currentSpeedBytesPerSec = 0L
                 syncKeepAliveService()
                 statusText = when {
@@ -2479,8 +2560,14 @@ private fun StatsPanel(vm: TrafficViewModel) {
                             FilterChip(selected = period == key, onClick = { period = key }, label = { Text("${label}榜") })
                         }
                     }
-                    Button(onClick = { vm.refreshCloudStats(period) }, enabled = !vm.statsLoading) {
-                        Text(if (vm.statsLoading) "同步中..." else "同步并刷新排行")
+                    Button(onClick = { vm.refreshCloudStats(period) }, enabled = vm.canManuallySyncCloudStats) {
+                        Text(
+                            when {
+                                vm.statsLoading -> "同步中..."
+                                vm.manualSyncCooldownSeconds > 0 -> "${vm.manualSyncCooldownSeconds} 秒后可同步"
+                                else -> "同步并刷新排行"
+                            },
+                        )
                     }
                     Text(vm.cloudStatus, style = MaterialTheme.typography.bodySmall)
                 }

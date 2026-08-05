@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.0.11 - 2026-08-05
+
+### Added
+
+- Added automatic cloud synchronization every 5 minutes while a traffic task is running.
+- Added per-account JSON configuration snapshots for links, UA profiles, runtime settings, and today's local statistics. Empty reinstalled clients restore the snapshot after login.
+
+### Changed
+
+- Manual leaderboard synchronization now has a 60-second cooldown and prevents overlapping sync requests.
+
 ## 1.0.10 - 2026-08-05
 
 ### Fixed
