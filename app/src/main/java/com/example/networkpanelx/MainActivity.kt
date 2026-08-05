@@ -1811,7 +1811,7 @@ private fun SettingsPanel(vm: TrafficViewModel) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CloudAccountPanel(vm: TrafficViewModel) {
-    var apiBaseUrl by rememberSaveable { mutableStateOf("") }
+    var apiBaseUrl by rememberSaveable { mutableStateOf(DEFAULT_CLOUD_API_URL) }
     var username by rememberSaveable { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
 

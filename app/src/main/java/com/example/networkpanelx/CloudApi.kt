@@ -14,6 +14,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+const val DEFAULT_CLOUD_API_URL = "http://39.98.88.224:50087"
+
 data class CloudSession(
     val apiBaseUrl: String,
     val username: String,
