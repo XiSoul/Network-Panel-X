@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.12`
+Current version: `1.0.13`
 
 ## Cloud Accounts And Rankings
 
@@ -37,7 +37,8 @@ Before using login and rankings on a device, deploy `server/` to a public Node h
 - While a traffic task is running, ranking and the account JSON snapshot sync automatically every 5 minutes. Manual ranking sync has a 60-second cooldown.
 - The cloud account stores one current JSON snapshot of links, UA profiles, runtime settings, and today's local statistics. When a reinstalled app logs in with no local links, it restores that snapshot automatically.
 - The app also writes a local JSON backup automatically to `Download/Network Panel X/network-panel-x.json`, which is visible in standard file managers and remains after an uninstall.
-- After an uninstall or an app-data clear, use **链接管理** -> **导入本地 JSON** to select that file. Android scoped storage does not allow a newly installed app to silently reopen the previous installation's public download.
+- The automatic recovery copy is also stored at `Android/media/com.example.networkpanelx/Network Panel X/network-panel-x.json`, which the app reads on startup when local links are empty and the file is still accessible to this installation.
+- After an uninstall or an app-data clear, use **设置** -> **本地 JSON** -> **导入本地 JSON** to select the Download copy. Android scoped storage can block a newly installed app from silently reopening an old public file, so manual import remains available.
 
 ## Settings
 

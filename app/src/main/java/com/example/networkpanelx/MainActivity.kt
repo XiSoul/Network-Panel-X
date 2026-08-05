@@ -5,6 +5,7 @@ import android.app.Activity
 import android.app.Application
 import android.content.ClipData
 import android.content.ClipboardManager
+import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
@@ -12,6 +13,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.PowerManager
 import android.provider.MediaStore
 import com.google.android.gms.net.CronetProviderInstaller
@@ -112,6 +114,7 @@ import org.chromium.net.CronetException
 import org.chromium.net.UrlRequest
 import org.chromium.net.UrlResponseInfo
 import java.io.InputStream
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
@@ -264,7 +267,68 @@ private class DeviceTrafficContributionStore(context: Context) {
 }
 
 private object PublicJsonBackup {
+    private fun mediaFile(context: Context): File? {
+        return context.getExternalMediaDirs().firstOrNull()?.let { File(it, "Network Panel X/$PUBLIC_BACKUP_FILE_NAME") }
+    }
+
+    private fun readFile(file: File?): JSONObject? {
+        if (file == null || !file.isFile) return null
+        return runCatching {
+            file.readText(Charsets.UTF_8).takeIf { it.isNotBlank() }?.let(::JSONObject)
+        }.getOrNull()
+    }
+
+    fun read(context: Context): JSONObject? {
+        val mediaBackupFile = mediaFile(context)
+        readFile(mediaBackupFile)?.let { return it }
+        return runCatching {
+            val resolver = context.contentResolver
+            val preferences = context.getSharedPreferences(PREFS_NAME, 0)
+            val savedUri = preferences.getString(PREF_PUBLIC_BACKUP_URI, null)?.let(Uri::parse)
+            val candidates = buildList {
+                if (savedUri != null) add(savedUri)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                    resolver.query(
+                        collection,
+                        arrayOf(MediaStore.MediaColumns._ID),
+                        "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} = ?",
+                        arrayOf(PUBLIC_BACKUP_FILE_NAME, PUBLIC_BACKUP_RELATIVE_PATH),
+                        "${MediaStore.MediaColumns.DATE_MODIFIED} DESC",
+                    )?.use { cursor ->
+                        while (cursor.moveToNext()) {
+                            add(ContentUris.withAppendedId(collection, cursor.getLong(0)))
+                        }
+                    }
+                } else {
+                    add(
+                        Uri.fromFile(
+                            File(
+                                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                                "Network Panel X/$PUBLIC_BACKUP_FILE_NAME",
+                            ),
+                        ),
+                    )
+                }
+            }
+            for (uri in candidates.distinct()) {
+                val raw = resolver.openInputStream(uri)?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }
+                if (!raw.isNullOrBlank()) return@runCatching JSONObject(raw)
+            }
+            null
+        }.onFailure {
+            Log.i("NetworkPanelX", "没有可读取的公共 JSON 备份", it)
+        }.getOrNull()
+    }
+
     fun write(context: Context, document: String) {
+        runCatching {
+            val file = mediaFile(context) ?: throw IllegalStateException("无法定位共享媒体目录")
+            file.parentFile?.mkdirs()
+            file.writeText(document, Charsets.UTF_8)
+        }.onFailure {
+            Log.w("NetworkPanelX", "写入 Android/media JSON 备份失败", it)
+        }
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
         runCatching {
             val resolver = context.contentResolver
@@ -586,7 +650,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         nextId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
         TrafficNotificationCommandBus.register(this)
         if (keepAliveEnabled) syncKeepAliveService()
-        schedulePublicJsonBackup()
+        restoreLocalJsonBackupIfNeeded()
     }
 
     fun updateThreadCount(value: Int) {
@@ -745,6 +809,30 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 statusText = "已从本地 JSON 恢复链接"
             }.onFailure {
                 statusText = it.message ?: "本地 JSON 恢复失败"
+            }
+        }
+    }
+
+    private fun restoreLocalJsonBackupIfNeeded() {
+        if (links.isNotEmpty()) {
+            schedulePublicJsonBackup()
+            return
+        }
+        viewModelScope.launch {
+            val document = withContext(Dispatchers.IO) {
+                PublicJsonBackup.read(getApplication())
+            }
+            if (document == null) {
+                schedulePublicJsonBackup()
+                return@launch
+            }
+            runCatching {
+                restoreBackupDocument(document)
+            }.onSuccess {
+                statusText = "已从本地 JSON 自动恢复链接"
+            }.onFailure {
+                statusText = it.message ?: "本地 JSON 自动恢复失败"
+                schedulePublicJsonBackup()
             }
         }
     }
@@ -2179,6 +2267,11 @@ private fun SpeedPanel(vm: TrafficViewModel) {
 private fun SettingsPanel(vm: TrafficViewModel) {
     val context = LocalContext.current
     var savedUserAgentName by rememberSaveable { mutableStateOf("") }
+    val localJsonImportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        uri?.let(vm::importLocalJsonBackup)
+    }
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) { vm.refreshBackgroundSystemStatus() }
@@ -2194,6 +2287,32 @@ private fun SettingsPanel(vm: TrafficViewModel) {
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("本地 JSON", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "启动时会自动尝试读取公共下载目录中的备份；也可以手动选择 JSON 恢复链接和设置。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                    )
+                    Button(
+                        onClick = { localJsonImportLauncher.launch(arrayOf("application/json", "text/plain")) },
+                        enabled = !vm.isRunning,
+                    ) {
+                        Text("导入本地 JSON")
+                    }
+                }
+            }
+        }
+
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -2983,11 +3102,6 @@ private fun LinkManagePanel(
     onQuickTrafficStarted: () -> Unit,
 ) {
     val expandedIds = rememberSaveable { mutableStateOf(setOf<Long>()) }
-    val localJsonImportLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.OpenDocument(),
-    ) { uri ->
-        uri?.let(vm::importLocalJsonBackup)
-    }
 
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Row(
@@ -3005,9 +3119,6 @@ private fun LinkManagePanel(
                 ) {
                     Button(onClick = { vm.addLink() }, enabled = !vm.isRunning) {
                         Text("新增链接")
-                    }
-                    Button(onClick = { localJsonImportLauncher.launch(arrayOf("application/json", "text/plain")) }, enabled = !vm.isRunning) {
-                        Text("导入本地 JSON")
                     }
                     Button(
                         onClick = {

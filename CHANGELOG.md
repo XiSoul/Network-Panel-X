@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.13 - 2026-08-05
+
+### Added
+
+- Added startup recovery from the app-owned `Android/media/com.example.networkpanelx/Network Panel X/network-panel-x.json` copy when local links are empty.
+- Moved **导入本地 JSON** to **设置** -> **本地 JSON**.
+- Kept the Download-folder import fallback for Android installations where scoped storage blocks automatic access to an old public file.
+
 ## 1.0.12 - 2026-08-05
 
 ### Added
