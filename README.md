@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.13`
+Current version: `1.0.14`
 
 ## Cloud Accounts And Rankings
 
@@ -29,7 +29,7 @@ Before using login and rankings on a device, deploy `server/` to a public Node h
 - Optional background keep-alive while running.
 - Background service notification appears as soon as background keep-alive is enabled.
 - Pause and resume traffic directly from the notification without opening the app.
-- Check GitHub Releases and open the project release list from **在线更新**.
+- Check GitHub Releases from **在线更新**; APK download links use `ghproxylist.com` as a proxy.
 - Light/dark theme switching.
 - Optional WebDAV or S3-compatible backup and restore for links, User-Agent profiles, runtime settings, and today's local statistics.
 - Backup browser accepts both timestamped versions and legacy JSON backups; daily cloud traffic is restored locally after account login.

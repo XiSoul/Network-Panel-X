@@ -164,6 +164,7 @@ private const val WORKER_STAGGER_MS = 8L
 private const val QUICK_TRAFFIC_TARGET_GB_TEXT = "0.1"
 private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X/releases/latest"
 private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X/releases"
+private const val UPDATE_DOWNLOAD_PROXY_PREFIX = "https://ghproxylist.com/"
 const val ACTION_START_FROM_NOTIFICATION = "com.example.networkpanelx.action.START_FROM_NOTIFICATION"
 const val ACTION_STOP_FROM_NOTIFICATION = "com.example.networkpanelx.action.STOP_FROM_NOTIFICATION"
 const val ACTION_PAUSE_FROM_NOTIFICATION = "com.example.networkpanelx.action.PAUSE_FROM_NOTIFICATION"
@@ -1067,6 +1068,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                     .map { it.optString("browser_download_url").trim() }
                     .firstOrNull { it.endsWith(".apk", ignoreCase = true) }
                     ?.ifBlank { null }
+                    ?.let { "$UPDATE_DOWNLOAD_PROXY_PREFIX$it" }
 
                 UpdateState.Available(
                     ReleaseInfo(
@@ -2288,29 +2290,7 @@ private fun SettingsPanel(vm: TrafficViewModel) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(20.dp),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-            ) {
-                Column(
-                    modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    Text("本地 JSON", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "启动时会自动尝试读取公共下载目录中的备份；也可以手动选择 JSON 恢复链接和设置。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
-                    )
-                    Button(
-                        onClick = { localJsonImportLauncher.launch(arrayOf("application/json", "text/plain")) },
-                        enabled = !vm.isRunning,
-                    ) {
-                        Text("导入本地 JSON")
-                    }
-                }
-            }
+            CloudAccountPanel(vm)
         }
 
         item {
@@ -2377,6 +2357,32 @@ private fun SettingsPanel(vm: TrafficViewModel) {
         }
 
         item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(20.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Text("本地 JSON", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "启动时会自动尝试读取公共下载目录中的备份；也可以手动选择 JSON 恢复链接和设置。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.66f),
+                    )
+                    Button(
+                        onClick = { localJsonImportLauncher.launch(arrayOf("application/json", "text/plain")) },
+                        enabled = !vm.isRunning,
+                    ) {
+                        Text("导入本地 JSON")
+                    }
+                }
+            }
+        }
+
+        item {
             BackgroundSettingsPanel(
                 vm = vm,
                 onRequestNotificationPermission = {
@@ -2414,10 +2420,6 @@ private fun SettingsPanel(vm: TrafficViewModel) {
                     }
                 },
             )
-        }
-
-        item {
-            CloudAccountPanel(vm)
         }
 
         item {

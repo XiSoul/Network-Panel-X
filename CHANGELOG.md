@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 1.0.14 - 2026-08-06
+
+### Changed
+
+- Routed in-app APK update downloads through `https://ghproxylist.com/` before the GitHub asset URL.
+- Reordered settings: cloud account and statistics, User-Agent, local JSON import, background operation, backup and restore, then online update.
+
 ## 1.0.13 - 2026-08-05
 
 ### Added
