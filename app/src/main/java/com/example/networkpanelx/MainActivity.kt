@@ -2748,7 +2748,16 @@ private fun StatsPanel(vm: TrafficViewModel) {
                     Text("本机今日流量：${formatBytes(vm.dailyTrafficBytes)}，任务数：${vm.dailyTaskCount}")
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         labels.forEach { (key, label) ->
-                            FilterChip(selected = period == key, onClick = { period = key }, label = { Text("${label}榜") })
+                            FilterChip(
+                                selected = period == key,
+                                onClick = {
+                                    if (period != key) {
+                                        period = key
+                                        vm.refreshCloudStats(key, isManual = false)
+                                    }
+                                },
+                                label = { Text("${label}榜") },
+                            )
                         }
                     }
                     Button(onClick = { vm.refreshCloudStats(period) }, enabled = vm.canManuallySyncCloudStats) {

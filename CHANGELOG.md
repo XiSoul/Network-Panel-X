@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.15 - 2026-08-16
+
+### Fixed
+
+- Fixed the monthly and yearly cloud ranking tabs continuing to display the previously loaded daily result. Switching ranking periods now immediately loads the selected period without triggering the manual synchronization cooldown.
+
 ## 1.0.14 - 2026-08-06
 
 ### Changed
