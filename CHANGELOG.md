@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.16 - 2026-08-16
+
+### Fixed
+
+- Automatically refresh the selected cloud ranking period when an authenticated user opens the statistics tab. Signed-out users do not trigger a cloud statistics request.
+
 ## 1.0.15 - 2026-08-16
 
 ### Fixed

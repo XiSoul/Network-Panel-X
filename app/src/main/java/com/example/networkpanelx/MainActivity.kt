@@ -2730,6 +2730,11 @@ private fun CloudAccountPanel(vm: TrafficViewModel) {
 private fun StatsPanel(vm: TrafficViewModel) {
     var period by rememberSaveable { mutableStateOf("day") }
     val labels = mapOf("day" to "日", "month" to "月", "year" to "年")
+    LaunchedEffect(vm.cloudUsername) {
+        if (vm.cloudUsername.isNotBlank()) {
+            vm.refreshCloudStats(period, isManual = false)
+        }
+    }
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         verticalArrangement = Arrangement.spacedBy(12.dp),
