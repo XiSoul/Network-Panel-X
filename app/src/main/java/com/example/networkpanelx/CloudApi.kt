@@ -27,7 +27,7 @@ import javax.crypto.spec.SecretKeySpec
 import java.util.concurrent.TimeUnit
 import org.xmlpull.v1.XmlPullParser
 
-const val DEFAULT_CLOUD_API_URL = "http://39.98.88.224:50087"
+const val DEFAULT_CLOUD_API_URL = "https://networkpanel.example.com"
 
 data class CloudSession(
     val apiBaseUrl: String,

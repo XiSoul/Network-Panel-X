@@ -61,6 +61,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
@@ -129,6 +130,13 @@ import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.resume
 import kotlin.math.max
+
+data class PublicIpInfo(
+    val ip: String,
+    val location: String,
+    val asn: String,
+    val isp: String,
+)
 
 private const val PREFS_NAME = "traffic_prefs"
 private const val PREF_LINKS = "links_json"
@@ -561,6 +569,13 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     var isDarkTheme by mutableStateOf(false)
         private set
 
+    var publicIpInfo by mutableStateOf<PublicIpInfo?>(null)
+        private set
+    var publicIpInfoLoading by mutableStateOf(false)
+        private set
+    var publicIpInfoError by mutableStateOf<String?>(null)
+        private set
+
     var updateState by mutableStateOf<UpdateState>(UpdateState.Idle)
         private set
 
@@ -652,6 +667,45 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         TrafficNotificationCommandBus.register(this)
         if (keepAliveEnabled) syncKeepAliveService()
         restoreLocalJsonBackupIfNeeded()
+        refreshPublicIpInfo()
+    }
+
+    fun refreshPublicIpInfo() {
+        if (publicIpInfoLoading) return
+        publicIpInfoLoading = true
+        publicIpInfoError = null
+        viewModelScope.launch {
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val request = Request.Builder()
+                        .url("https://hackmyip.com/api/ip")
+                        .get()
+                        .build()
+                    httpClient.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) error("HTTP ${response.code}")
+                        val data = JSONObject(response.body?.string().orEmpty()).optJSONObject("data")
+                            ?: error("响应数据为空")
+                        val location = data.optJSONObject("location")
+                        val network = data.optJSONObject("network")
+                        PublicIpInfo(
+                            ip = data.optString("ip").ifBlank { "-" },
+                            location = listOfNotNull(
+                                location?.optString("city")?.takeIf { it.isNotBlank() },
+                                location?.optString("region")?.takeIf { it.isNotBlank() },
+                                location?.optString("country_name")?.takeIf { it.isNotBlank() },
+                            ).joinToString(", ").ifBlank { "未知" },
+                            asn = network?.optString("asn")?.takeIf { it.isNotBlank() }?.let { "AS$it" } ?: "未知",
+                            isp = network?.optString("isp")?.ifBlank { "未知" } ?: "未知",
+                        )
+                    }
+                }
+            }.onSuccess {
+                publicIpInfo = it
+            }.onFailure {
+                publicIpInfoError = it.message ?: "IP 信息获取失败"
+            }
+            publicIpInfoLoading = false
+        }
     }
 
     fun updateThreadCount(value: Int) {
@@ -2182,14 +2236,13 @@ private fun SpeedPanel(vm: TrafficViewModel) {
                             .height(10.dp),
                     )
 
-                    FlowRow(
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        MetricCard("实时网速", "${formatBytes(vm.currentSpeedBytesPerSec)}/s")
-                        MetricCard("总进度", if (hasFiniteTotalTarget) "${"%.2f".format(progress * 100f)}%" else "无限")
-                        MetricCard("预计剩余", if (etaSec >= 0L) formatDuration(etaSec) else "-")
+                        MetricCard("实时网速", "${formatBytes(vm.currentSpeedBytesPerSec)}/s", Modifier.weight(1f))
+                        MetricCard("总进度", if (hasFiniteTotalTarget) "${"%.2f".format(progress * 100f)}%" else "无限", Modifier.weight(1f))
+                        MetricCard("预计剩余", if (etaSec >= 0L) formatDuration(etaSec) else "-", Modifier.weight(1f))
                     }
                 }
             }
@@ -2232,6 +2285,10 @@ private fun SpeedPanel(vm: TrafficViewModel) {
                     Text("停止")
                 }
             }
+        }
+
+        item {
+            PublicIpCard(vm)
         }
 
         item {
@@ -3080,8 +3137,9 @@ private fun UserAgentDropdown(
 }
 
 @Composable
-private fun MetricCard(label: String, value: String) {
+private fun MetricCard(label: String, value: String, modifier: Modifier = Modifier) {
     Card(
+        modifier = modifier,
         shape = RoundedCornerShape(18.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
     ) {
@@ -3089,9 +3147,53 @@ private fun MetricCard(label: String, value: String) {
             modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
-            Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f))
-            Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(value, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
+    }
+}
+
+@Composable
+private fun PublicIpCard(vm: TrafficViewModel) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(20.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("公网 IP 信息", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                TextButton(onClick = vm::refreshPublicIpInfo, enabled = !vm.publicIpInfoLoading) {
+                    Text(if (vm.publicIpInfoLoading) "刷新中" else "刷新")
+                }
+            }
+            when {
+                vm.publicIpInfoLoading && vm.publicIpInfo == null -> Text("正在获取公网 IP…")
+                vm.publicIpInfo != null -> {
+                    val info = vm.publicIpInfo!!
+                    IpInfoRow("IP 地址", info.ip)
+                    IpInfoRow("位置", info.location)
+                    IpInfoRow("ASN", info.asn)
+                    IpInfoRow("运营商", info.isp)
+                }
+                else -> Text(vm.publicIpInfoError ?: "暂无 IP 信息")
+            }
+        }
+    }
+}
+
+@Composable
+private fun IpInfoRow(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        Text(label, modifier = Modifier.size(width = 56.dp, height = 24.dp), color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f), maxLines = 1)
+        Text(value, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
     }
 }
 

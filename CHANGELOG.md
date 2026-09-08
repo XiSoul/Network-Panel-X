@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.0.17 - 2026-09-08
+
+### Added
+
+- Added public IP information on the speed test page, including IP address, location, ASN, and ISP.
+- Added the NAS cloud API endpoint to the release configuration.
+
+### Fixed
+
+- Kept the runtime metrics in a fixed three-column row and truncated long values cleanly.
+
 ## 1.0.16 - 2026-08-16
 
 ### Fixed
