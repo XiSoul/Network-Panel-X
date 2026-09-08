@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.0.18 - 2026-09-08
+
+### Fixed
+
+- Migrated saved cloud sessions from the retired HTTP/IP endpoint to the HTTPS NAS API endpoint after upgrading.
+
 ## 1.0.17 - 2026-09-08
 
 ### Added

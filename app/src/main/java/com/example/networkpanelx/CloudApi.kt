@@ -58,10 +58,15 @@ class CloudSessionStore(context: Context) {
     )
 
     fun load(): CloudSession? {
-        val apiBaseUrl = preferences.getString("api_base_url", "").orEmpty()
+        val storedApiBaseUrl = preferences.getString("api_base_url", "").orEmpty()
         val username = preferences.getString("username", "").orEmpty()
         val token = preferences.getString("token", "").orEmpty()
-        return if (apiBaseUrl.isBlank() || username.isBlank() || token.isBlank()) null else {
+        return if (storedApiBaseUrl.isBlank() || username.isBlank() || token.isBlank()) null else {
+            // Move sessions created by older builds from the retired HTTP/IP endpoint to HTTPS.
+            val apiBaseUrl = DEFAULT_CLOUD_API_URL
+            if (storedApiBaseUrl != apiBaseUrl) {
+                preferences.edit().putString("api_base_url", apiBaseUrl).apply()
+            }
             CloudSession(apiBaseUrl, username, token)
         }
     }
