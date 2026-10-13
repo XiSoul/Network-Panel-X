@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 1.0.19 - 2026-10-13
+
+### Added
+
+- Added an optional encrypted **保存密码** setting on the cloud login screen.
+- The last cloud username is restored automatically when opening the login screen.
+
+### Fixed
+
+- Extended cloud login tokens to keep long-running statistics sessions signed in.
+- Preserved saved login credentials when logging out, while still clearing the active session token.
+- Added a Cronet initialization fallback for HarmonyOS environments that cannot load the Google Cronet provider.
+
 ## 1.0.18 - 2026-09-08
 
 ### Fixed

@@ -599,6 +599,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         get() = remoteBackups.drop(backupPage * BACKUP_PAGE_SIZE).take(BACKUP_PAGE_SIZE)
     var cloudUsername by mutableStateOf(cloudSession?.username.orEmpty())
         private set
+    val savedCloudUsername: String
+        get() = cloudSessionStore.savedUsername().ifBlank { cloudUsername }
+    val savedCloudPassword: String
+        get() = cloudSessionStore.savedPassword()
     var cloudStatus by mutableStateOf(if (cloudSession != null) "已登录" else "未登录")
         private set
     var dailyTrafficBytes by mutableLongStateOf(0L)
@@ -738,7 +742,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         CloudApi.register(apiBaseUrl, username, email, password, code)
     }
 
-    fun loginCloudAccount(apiBaseUrl: String, username: String, password: String) = authenticateCloudAccount {
+    fun loginCloudAccount(apiBaseUrl: String, username: String, password: String, rememberPassword: Boolean) = authenticateCloudAccount {
+        cloudSessionStore.saveLoginCredentials(username, password, rememberPassword)
         CloudApi.login(apiBaseUrl, username, password)
     }
 
@@ -1673,11 +1678,13 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         cronetReadyAttempted = true
 
         val app = getApplication<Application>()
-        val installed = suspendCancellableCoroutine<Boolean> { cont ->
-            CronetProviderInstaller.installProvider(app).addOnCompleteListener { task ->
-                cont.resume(task.isSuccessful)
+        val installed = runCatching {
+            suspendCancellableCoroutine<Boolean> { cont ->
+                CronetProviderInstaller.installProvider(app).addOnCompleteListener { task ->
+                    if (cont.isActive) cont.resume(task.isSuccessful)
+                }
             }
-        }
+        }.getOrDefault(false)
         if (!installed) return null
 
         return try {
@@ -2690,8 +2697,9 @@ private fun formatBackupTime(epochMs: Long): String {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun CloudAccountPanel(vm: TrafficViewModel) {
-    var username by rememberSaveable { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
+    var username by rememberSaveable { mutableStateOf(vm.savedCloudUsername) }
+    var password by remember { mutableStateOf(vm.savedCloudPassword) }
+    var rememberPassword by rememberSaveable { mutableStateOf(vm.savedCloudPassword.isNotBlank()) }
     var email by rememberSaveable { mutableStateOf("") }
     var code by rememberSaveable { mutableStateOf("") }
     var accountMode by rememberSaveable { mutableStateOf("login") }
@@ -2746,6 +2754,12 @@ private fun CloudAccountPanel(vm: TrafficViewModel) {
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     singleLine = true,
                 )
+                if (accountMode == "login") {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = rememberPassword, onCheckedChange = { rememberPassword = it })
+                        Text("保存密码")
+                    }
+                }
                 if (accountMode != "login") {
                     OutlinedTextField(
                         value = code,
@@ -2761,7 +2775,7 @@ private fun CloudAccountPanel(vm: TrafficViewModel) {
                     verticalArrangement = Arrangement.spacedBy(10.dp),
                 ) {
                     when (accountMode) {
-                        "login" -> Button(onClick = { vm.loginCloudAccount(DEFAULT_CLOUD_API_URL, username, password) }) { Text("登录") }
+                        "login" -> Button(onClick = { vm.loginCloudAccount(DEFAULT_CLOUD_API_URL, username, password, rememberPassword) }) { Text("登录") }
                         "register" -> {
                             Button(onClick = { vm.requestCloudRegistrationCode(DEFAULT_CLOUD_API_URL, username, email, password) }) { Text("发送验证码") }
                             Button(onClick = { vm.registerCloudAccount(DEFAULT_CLOUD_API_URL, username, email, password, code) }) { Text("完成注册") }

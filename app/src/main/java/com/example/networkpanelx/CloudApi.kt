@@ -79,8 +79,21 @@ class CloudSessionStore(context: Context) {
             .apply()
     }
 
+    fun savedUsername(): String = preferences.getString("saved_username", "").orEmpty()
+
+    fun savedPassword(): String = preferences.getString("saved_password", "").orEmpty()
+
+    fun saveLoginCredentials(username: String, password: String, rememberPassword: Boolean) {
+        preferences.edit()
+            .putString("saved_username", username.trim())
+            .apply {
+                if (rememberPassword) putString("saved_password", password) else remove("saved_password")
+            }
+            .apply()
+    }
+
     fun clear() {
-        preferences.edit().clear().apply()
+        preferences.edit().remove("api_base_url").remove("username").remove("token").apply()
     }
 }
 

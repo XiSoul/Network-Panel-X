@@ -96,7 +96,7 @@ async function verifyCode({ purpose, emailNormalized, code }) {
 
 function issueToken(user) {
   return jwt.sign({ sub: String(user.id), username: user.username }, config.jwtSecret, {
-    expiresIn: "30d",
+    expiresIn: "10y",
     issuer: "network-panel-x",
     audience: "network-panel-x-app",
   });

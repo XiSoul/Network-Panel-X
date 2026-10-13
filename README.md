@@ -4,7 +4,7 @@ Android app for batch traffic consumption and network speed testing with user-de
 
 ## Version
 
-Current version: `1.0.18`
+Current version: `1.0.19`
 
 ## Cloud Accounts And Rankings
 
