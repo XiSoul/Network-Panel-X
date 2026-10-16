@@ -20,17 +20,10 @@ android {
         applicationId = "com.example.networkpanelx"
         minSdk = 26
         targetSdk = 34
-        versionCode = 20
-        versionName = "1.0.19"
+        versionCode = 21
+        versionName = "1.0.20"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
-        // 生产云端 API 地址：只从 local.properties 读取（不入库），未配置时为空串走占位符。
-        buildConfigField(
-            "String",
-            "DEFAULT_CLOUD_API_URL",
-            "\"${localProperties.getProperty("DEFAULT_CLOUD_API_URL", "")}\"",
-        )
     }
 
     signingConfigs {
