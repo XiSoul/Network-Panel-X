@@ -1,6 +1,5 @@
 package com.example.networkpanelx
 
-import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -8,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.app.AlarmManager
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -73,19 +73,12 @@ class TrafficKeepAliveService : Service() {
     }
 
     /**
-     * Android 14+ may still call onTimeout for specialUse services in rare OEM builds. If it
-     * fires while a task is active, restart ourselves shortly so the run survives.
+     * FGS type-specific timeout (Android 14+). Schedule an immediate self-restart so the
+     * measured run survives, then let the system stop this instance cleanly.
+     * NOTE: only the single-arg onTimeout exists up to compileSdk 34.
      */
-    override fun onTimeout(startId: Int, fgsType: Int) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            Log.w("TrafficKeepAliveService", "FGS timeout (type=$fgsType); scheduling restart")
-            scheduleSelfRestart()
-        }
-        stopSelf(startId)
-    }
-
     override fun onTimeout(startId: Int) {
-        Log.w("TrafficKeepAliveService", "FGS timeout (legacy); scheduling restart")
+        Log.w("TrafficKeepAliveService", "FGS onTimeout; scheduling self-restart")
         scheduleSelfRestart()
         stopSelf(startId)
     }
