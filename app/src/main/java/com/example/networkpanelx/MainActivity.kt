@@ -172,8 +172,8 @@ private const val CRONET_FAILURE_THRESHOLD = 3
 private const val FAST_RETRY_DELAY_MS = 0L
 private const val WORKER_STAGGER_MS = 8L
 private const val QUICK_TRAFFIC_TARGET_GB_TEXT = "0.1"
-private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X/releases/latest"
-private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X/releases"
+private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X-Releases/releases/latest"
+private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X-Releases/releases"
 private const val UPDATE_DOWNLOAD_PROXY_PREFIX = "https://ghproxylist.com/"
 const val ACTION_START_FROM_NOTIFICATION = "com.example.networkpanelx.action.START_FROM_NOTIFICATION"
 const val ACTION_STOP_FROM_NOTIFICATION = "com.example.networkpanelx.action.STOP_FROM_NOTIFICATION"
@@ -665,8 +665,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private var cronetReadyAttempted = false
 
     // Process-lifetime scope for the download run: survives Activity destruction and
-    // ViewModel onCleared(). Previously the run lived in viewModelScope, so the OS reclaiming
-    // the backgrounded Activity silently killed overnight downloads.
+    // ViewModel onCleared(). Previously the run lived in viewModelScope, so the OS
+    // reclaiming the backgrounded Activity silently killed overnight downloads.
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
