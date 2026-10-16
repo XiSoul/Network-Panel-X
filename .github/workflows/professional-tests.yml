@@ -1,0 +1,71 @@
+name: Professional Test Suite
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: Unit tests + Lint + Release build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x ./gradlew
+
+      - name: Debug build (compile check)
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Unit tests (JVM)
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+      - name: Publish unit test results summary
+        if: always()
+        run: |
+          echo "## Unit Test Results" >> $GITHUB_STEP_SUMMARY
+          find app/build/test-results -name "*.xml" | head -20
+          TESTS=$(find app/build/test-results -name "TEST-*.xml" | wc -l)
+          echo "Found $TESTS test result files" >> $GITHUB_STEP_SUMMARY
+
+      - name: Android Lint
+        run: ./gradlew --no-daemon lintDebug
+        continue-on-error: true
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint-report
+          path: app/build/reports/lint-results-debug.*
+          if-no-files-found: warn
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: warn
+
+      - name: Server smoke test (Node)
+        run: |
+          cd server
+          npm ci || npm install
+          node --check src/index.mjs && echo "server syntax OK"
+
+      - name: Dependency vulnerability scan (npm audit)
+        run: |
+          cd server
+          npm audit --omit=dev || true
