@@ -10,7 +10,7 @@ Current version: `1.0.19`
 
 The optional account and leaderboard service is under `server/`. New accounts require a verified email code; password recovery also uses a code sent to that verified email. It stores password and code hashes plus aggregated daily traffic in TiDB. The Android app never contains TiDB or SMTP credentials.
 
-Before using login and rankings on a device, deploy `server/` to a public Node host and set `DEFAULT_CLOUD_API_URL` in `CloudApi.kt` for the release build. The address is built into the app and is not entered by end users. A Dockerfile and `render.yaml` are included for a Render deployment; setup details are in `server/README.md`.
+Before using login and rankings on a device, deploy `server/` to a public Node host and set `DEFAULT_CLOUD_API_URL` in `local.properties` for the release build. The address is injected at build time, is not stored in Git, and is not entered by end users. A Dockerfile and `render.yaml` are included for a Render deployment; setup details are in `server/README.md`.
 
 ## Features
 
@@ -81,15 +81,12 @@ Release build:
 ./gradlew assembleRelease
 ```
 
-The release package is signed with the project release keystore:
-
-```text
-app/signing/networkpanelx-release.jks
-alias: networkpanelx
-```
+The release package is signed with the project release keystore. The keystore file, alias, and all signing passwords are **secrets**: they live only in `local.properties` (git-ignored) on the build machine, or in CI secret variables. They are never committed to Git, and their values are intentionally not documented here.
 
 Signing passwords should be kept only in local ignored files such as `local.properties` or `signing-secrets.txt`.
 Do not commit signing passwords or keystore files to Git.
+
+Cloud API endpoint: the production `DEFAULT_CLOUD_API_URL` is configured via `local.properties` (key `DEFAULT_CLOUD_API_URL`) and injected at build time; it is not stored in this repository.
 
 ## Release Output
 
