@@ -27,7 +27,11 @@ import javax.crypto.spec.SecretKeySpec
 import java.util.concurrent.TimeUnit
 import org.xmlpull.v1.XmlPullParser
 
-const val DEFAULT_CLOUD_API_URL = "https://networkpanel.example.com"
+// 生产 API 地址包含部署信息，不进源码仓库。
+// 真实地址通过 local.properties 的 DEFAULT_CLOUD_API_URL 配置（app/build.gradle.kts 读取），
+// 未配置时使用占位地址，云端功能将提示配置后使用。
+private const val DEFAULT_CLOUD_API_URL_PLACEHOLDER = "https://networkpanel.example.com"
+val DEFAULT_CLOUD_API_URL: String = BuildConfig.DEFAULT_CLOUD_API_URL.ifBlank { DEFAULT_CLOUD_API_URL_PLACEHOLDER }
 
 data class CloudSession(
     val apiBaseUrl: String,

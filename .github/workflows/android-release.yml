@@ -43,6 +43,7 @@ jobs:
           STORE_PASSWORD: ${{ secrets.ANDROID_RELEASE_STORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_RELEASE_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_RELEASE_KEY_PASSWORD }}
+          CLOUD_API_URL: ${{ secrets.DEFAULT_CLOUD_API_URL }}
         run: |
           test -n "$KEYSTORE_BASE64"
           test -n "$STORE_PASSWORD"
@@ -55,6 +56,7 @@ jobs:
             echo "RELEASE_STORE_PASSWORD=$STORE_PASSWORD"
             echo "RELEASE_KEY_ALIAS=$KEY_ALIAS"
             echo "RELEASE_KEY_PASSWORD=$KEY_PASSWORD"
+            echo "DEFAULT_CLOUD_API_URL=$CLOUD_API_URL"
           } > local.properties
 
       - name: Verify release version
