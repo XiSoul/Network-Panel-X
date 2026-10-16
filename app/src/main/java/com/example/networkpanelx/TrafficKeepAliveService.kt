@@ -1,5 +1,6 @@
 package com.example.networkpanelx
 
+import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -10,6 +11,8 @@ import android.content.Intent
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
+import android.util.Log
 
 class TrafficKeepAliveService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
@@ -67,6 +70,47 @@ class TrafficKeepAliveService : Service() {
         (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
             .cancel(LEGACY_LOCK_SCREEN_NOTIFICATION_ID)
         super.onDestroy()
+    }
+
+    /**
+     * Android 14+ may still call onTimeout for specialUse services in rare OEM builds. If it
+     * fires while a task is active, restart ourselves shortly so the run survives.
+     */
+    override fun onTimeout(startId: Int, fgsType: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            Log.w("TrafficKeepAliveService", "FGS timeout (type=$fgsType); scheduling restart")
+            scheduleSelfRestart()
+        }
+        stopSelf(startId)
+    }
+
+    override fun onTimeout(startId: Int) {
+        Log.w("TrafficKeepAliveService", "FGS timeout (legacy); scheduling restart")
+        scheduleSelfRestart()
+        stopSelf(startId)
+    }
+
+    private fun scheduleSelfRestart() {
+        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+        val restartIntent = Intent(this, TrafficKeepAliveService::class.java).apply {
+            action = ACTION_SELF_RESTART
+            putExtra(EXTRA_TASK_RUNNING, taskRunning)
+            putExtra(EXTRA_TASK_NAME, taskName)
+            putExtra(EXTRA_TOTAL_CONSUMED_BYTES, totalConsumedBytes)
+            putExtra(EXTRA_TOTAL_TARGET_BYTES, totalTargetBytes)
+            putExtra(EXTRA_SPEED_BYTES_PER_SEC, speedBytesPerSec)
+        }
+        val pendingIntent = PendingIntent.getService(
+            this,
+            SELF_RESTART_REQUEST_CODE,
+            restartIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        alarmManager.set(
+            AlarmManager.ELAPSED_REALTIME,
+            SystemClock.elapsedRealtime() + SELF_RESTART_DELAY_MS,
+            pendingIntent,
+        )
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -205,6 +249,9 @@ class TrafficKeepAliveService : Service() {
         private const val EXTRA_TOTAL_CONSUMED_BYTES = "total_consumed_bytes"
         private const val EXTRA_TOTAL_TARGET_BYTES = "total_target_bytes"
         private const val EXTRA_SPEED_BYTES_PER_SEC = "speed_bytes_per_sec"
+        private const val ACTION_SELF_RESTART = "com.example.networkpanelx.action.SELF_RESTART"
+        private const val SELF_RESTART_REQUEST_CODE = 1005
+        private const val SELF_RESTART_DELAY_MS = 1_500L
 
         fun start(
             context: Context,
