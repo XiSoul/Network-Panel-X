@@ -95,21 +95,27 @@ async function verifyCode({ purpose, emailNormalized, code }) {
 }
 
 function issueToken(user) {
-  return jwt.sign({ sub: String(user.id), username: user.username }, config.jwtSecret, {
+  return jwt.sign({ sub: String(user.id), username: user.username, tv: user.token_version ?? 0 }, config.jwtSecret, {
     expiresIn: "10y",
     issuer: "network-panel-x",
     audience: "network-panel-x-app",
   });
 }
 
-function requireUser(request, response, next) {
+async function requireUser(request, response, next) {
   const token = request.header("Authorization")?.replace(/^Bearer\s+/i, "");
   if (!token) return response.status(401).json({ error: "未登录" });
   try {
-    request.user = jwt.verify(token, config.jwtSecret, {
+    const claims = jwt.verify(token, config.jwtSecret, {
       issuer: "network-panel-x",
       audience: "network-panel-x-app",
     });
+    // token 版本号校验：改密/重置后 token_version 递增，旧 token 全部失效
+    const [rows] = await pool.execute("SELECT token_version FROM users WHERE id = ? LIMIT 1", [Number(claims.sub)]);
+    if (!rows[0] || Number(rows[0].token_version) !== Number(claims.tv ?? 0)) {
+      return response.status(401).json({ error: "登录状态已失效，请重新登录" });
+    }
+    request.user = claims;
     next();
   } catch {
     response.status(401).json({ error: "登录已过期，请重新登录" });
@@ -247,7 +253,13 @@ app.post("/v1/auth/password-reset/request-code", async (request, response, next)
       return response.status(429).json({ error: "验证码已发送，请 60 秒后再试" });
     }
     const code = createVerificationCode();
-    await sendVerificationCode({ email, code, purpose: "reset" });
+    try {
+      await sendVerificationCode({ email, code, purpose: "reset" });
+    } catch (error) {
+      // SMTP 故障时保持 202 与未注册邮箱一致，防止通过响应差异枚举已注册邮箱
+      console.error("reset verification email failed:", error?.message || error);
+      return response.status(202).json({ message: "若该邮箱已注册，验证码将发送到邮箱" });
+    }
     await pool.execute(
       `INSERT INTO email_verifications (purpose, email, email_normalized, code_hash, expires_at, sent_at, attempt_count)
        VALUES ('reset', ?, ?, ?, ?, CURRENT_TIMESTAMP(3), 0)
@@ -273,7 +285,7 @@ app.post("/v1/auth/password-reset/confirm", async (request, response, next) => {
     try {
       await connection.beginTransaction();
       const [result] = await connection.execute(
-        "UPDATE users SET password_hash = ? WHERE email_normalized = ?",
+        "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE email_normalized = ?",
         [await bcrypt.hash(password, 12), emailNormalized],
       );
       await connection.execute("DELETE FROM email_verifications WHERE purpose = 'reset' AND email_normalized = ?", [emailNormalized]);
@@ -299,7 +311,7 @@ app.post("/v1/auth/login", async (request, response, next) => {
     if (validationError) return response.status(400).json({ error: "用户名或密码错误" });
 
     const [rows] = await pool.execute(
-      "SELECT id, username, password_hash FROM users WHERE username_normalized = ? LIMIT 1",
+      "SELECT id, username, password_hash, token_version FROM users WHERE username_normalized = ? LIMIT 1",
       [normalizeUsername(username)],
     );
     const user = rows[0];
