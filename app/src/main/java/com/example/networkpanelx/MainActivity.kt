@@ -93,8 +93,10 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -170,8 +172,8 @@ private const val CRONET_FAILURE_THRESHOLD = 3
 private const val FAST_RETRY_DELAY_MS = 0L
 private const val WORKER_STAGGER_MS = 8L
 private const val QUICK_TRAFFIC_TARGET_GB_TEXT = "0.1"
-private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X-Releases/releases/latest"
-private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X-Releases/releases"
+private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X/releases/latest"
+private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X/releases"
 private const val UPDATE_DOWNLOAD_PROXY_PREFIX = "https://ghproxylist.com/"
 const val ACTION_START_FROM_NOTIFICATION = "com.example.networkpanelx.action.START_FROM_NOTIFICATION"
 const val ACTION_STOP_FROM_NOTIFICATION = "com.example.networkpanelx.action.STOP_FROM_NOTIFICATION"
@@ -661,6 +663,11 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         .build()
     private var cronetEngine: CronetEngine? = null
     private var cronetReadyAttempted = false
+
+    // Process-lifetime scope for the download run: survives Activity destruction and
+    // ViewModel onCleared(). Previously the run lived in viewModelScope, so the OS reclaiming
+    // the backgrounded Activity silently killed overnight downloads.
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
         loadLinks()
@@ -1391,7 +1398,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         syncKeepAliveService()
         startAutoCloudSync()
 
-        runJob = viewModelScope.launch(Dispatchers.IO) {
+        runJob = appScope.launch(Dispatchers.IO) {
             for ((index, task) in parsed.withIndex()) {
                 if (!isActive) break
 
@@ -2106,9 +2113,12 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         TrafficNotificationCommandBus.unregister(this)
         super.onCleared()
-        TrafficKeepAliveService.stop(getApplication())
-        cronetEngine?.shutdown()
-        cronetEngine = null
+        // Keep the run and the keep-alive service alive after Activity death: the download now
+        // lives in appScope and the foreground service keeps the process alive. Only stop the
+        // service when the run itself has finished (user pressed stop or all tasks done).
+        if (!isRunning) {
+            TrafficKeepAliveService.stop(getApplication())
+        }
     }
 
     class Factory(private val app: Application) : ViewModelProvider.Factory {
