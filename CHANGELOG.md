@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 1.0.20 - 2026-10-16
+
+### Fixed
+
+- 后台存活修复：下载任务在应用被系统后台回收后不再中断 — 下载改到 `applicationScope` 协程域运行，Activity 销毁（`onCleared`）不终止进行中的任务。
+- 前台服务改用 `specialUse` 类型（原 `dataSync`），规避 Android 14+ 对 dataSync 类前台服务的 6 小时强制超时；并新增 `onTimeout` 自重启兜底（单参签名，兼容 SDK 34）。
+- `TrafficKeepAliveService` / `MainActivity` / `AndroidManifest` 三处协同调整，提升后台保活能力（国内 ROM 后台查杀场景）。
+
 ## 1.0.19 - 2026-10-13
 
 ### Added
@@ -11,9 +19,10 @@
 
 ### Fixed
 
+- **鸿蒙白屏修复**：HarmonyOS 环境无法加载 Google Cronet provider 导致启动白屏 — 增加 Cronet 初始化回退（fallback），Cronet 不可用时回退到系统网络栈。
 - Extended cloud login tokens to keep long-running statistics sessions signed in.
 - Preserved saved login credentials when logging out, while still clearing the active session token.
-- Added a Cronet initialization fallback for HarmonyOS environments that cannot load the Google Cronet provider.
+
 
 ## 1.0.18 - 2026-09-08
 
