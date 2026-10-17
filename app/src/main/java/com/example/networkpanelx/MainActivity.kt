@@ -170,6 +170,8 @@ private const val CRONET_FAILURE_THRESHOLD = 3
 private const val FAST_RETRY_DELAY_MS = 0L
 private const val WORKER_STAGGER_MS = 8L
 private const val QUICK_TRAFFIC_TARGET_GB_TEXT = "0.1"
+// 应用内更新走公开壳仓库 Network-Panel-X-Releases（而非本仓库）：
+// 本仓库历史曾包含未公开信息，壳仓库只存 APK 资产，更新链路与之隔离。
 private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X-Releases/releases/latest"
 private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X-Releases/releases"
 private const val UPDATE_DOWNLOAD_PROXY_PREFIX = "https://ghproxylist.com/"

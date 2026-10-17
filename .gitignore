@@ -4,6 +4,11 @@ build/
 **/build/
 
 # Local config
+# 以下文件承载真实密钥/生产地址（值见 CI secrets 与团队密码管理，绝不提交）：
+# local.properties   — Android SDK 路径 + DEFAULT_CLOUD_API_URL + 签名四项
+# signing-secrets.txt — 签名密码备忘
+# app/signing/       — release keystore (jks)
+# server/.env*       — 服务端 DB/SMTP/JWT 真实凭据
 local.properties
 signing-secrets.txt
 app/signing/
