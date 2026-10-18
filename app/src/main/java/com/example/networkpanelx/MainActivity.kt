@@ -93,8 +93,10 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.cancelChildren
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -663,6 +665,11 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         .build()
     private var cronetEngine: CronetEngine? = null
     private var cronetReadyAttempted = false
+
+    // Process-lifetime scope for the download run: survives Activity destruction and
+    // ViewModel onCleared(). Previously the run lived in viewModelScope, so the OS
+    // reclaiming the backgrounded Activity silently killed overnight downloads.
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
         loadLinks()
@@ -1393,7 +1400,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         syncKeepAliveService()
         startAutoCloudSync()
 
-        runJob = viewModelScope.launch(Dispatchers.IO) {
+        runJob = appScope.launch(Dispatchers.IO) {
             for ((index, task) in parsed.withIndex()) {
                 if (!isActive) break
 
@@ -2108,9 +2115,12 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         TrafficNotificationCommandBus.unregister(this)
         super.onCleared()
-        TrafficKeepAliveService.stop(getApplication())
-        cronetEngine?.shutdown()
-        cronetEngine = null
+        // Keep the run and the keep-alive service alive after Activity death: the download now
+        // lives in appScope and the foreground service keeps the process alive. Only stop the
+        // service when the run itself has finished (user pressed stop or all tasks done).
+        if (!isRunning) {
+            TrafficKeepAliveService.stop(getApplication())
+        }
     }
 
     class Factory(private val app: Application) : ViewModelProvider.Factory {
