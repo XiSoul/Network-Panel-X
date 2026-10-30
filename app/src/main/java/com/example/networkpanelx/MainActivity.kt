@@ -97,6 +97,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -104,6 +105,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import okhttp3.ConnectionPool
 import okhttp3.CacheControl
 import okhttp3.Dispatcher
@@ -148,6 +150,10 @@ private const val PREF_USER_AGENT = "user_agent"
 private const val PREF_USER_AGENT_LIST = "user_agent_list"
 private const val PREF_KEEP_ALIVE = "keep_alive"
 private const val PREF_KEEP_SCREEN_AWAKE = "keep_screen_awake"
+// P0-8h 修复③：进程被系统杀后的自动续跑标记（正常结束/用户停止会清除）
+private const val PREF_AUTO_RESUME = "auto_resume_run"
+private const val PREF_AUTO_RESUME_AT = "auto_resume_started_at"
+private const val AUTO_RESUME_MAX_AGE_MS = 24 * 60 * 60 * 1000L
 private const val PREF_PROGRESS_NOTIFICATION = "progress_notification"
 private const val PREF_DAILY_TRAFFIC_DATE = "daily_traffic_date"
 private const val PREF_DAILY_TRAFFIC_BYTES = "daily_traffic_bytes"
@@ -162,20 +168,52 @@ private const val PREF_PUBLIC_BACKUP_URI = "public_backup_uri"
 private const val LEGACY_ANDROID_APP_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; Network-Panel-X Build/UP1A.231005.007)"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
-private const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
+const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
 private const val READ_BUFFER_SIZE = 1024 * 1024
 private const val DEFAULT_ADAPTIVE_CHUNK_SIZE_BYTES = 2L * 1024L * 1024L
-private const val MIN_ADAPTIVE_CHUNK_SIZE_BYTES = 128L * 1024L
+
+/**
+ * 动态切片阈值：小于此大小的文件不做 Range 切片，走「整文件 GET → 立即重试」循环。
+ *
+ * 原因（2026-10-30 实测）：0.6MB gif 的 TTFB 是 50ms，而整文件传输只要 30ms。
+ * 切成 32KB 分片后，每个分片都要付一次 50ms 的 TTFB，分片反而比整文件慢。
+ * 整文件 GET 让 64 个 worker 各自下完整个文件再重来，吞吐量直接按并发数线性放大。
+ */
+private const val SMALL_FILE_NO_SLICE_BYTES = 2L * 1024L * 1024L
+
+/**
+ * 小文件循环下载成功后的间隔。原来是 250ms 退避（RETRY_BACKOFF_BASE_MS），
+ * 对 80ms 就能下完的文件等于白等 3 倍时间，实测效率只有 24%。
+ * 小文件循环不涉及「压测 CDN」风险，给个极短间隔让 worker 立刻发起下一轮。
+ */
+private const val SMALL_FILE_LOOP_DELAY_MS = 5L
+
+/**
+ * 动态切片的时间预算：分片的传输时长应至少是 TTFB 的 3 倍，
+ * 否则请求建立开销主导，切片越细越慢。
+ */
+private const val TTFB_BUDGET_MS = 50L
+private const val MIN_ADAPTIVE_CHUNK_SIZE_BYTES = 32L * 1024L
 private const val MAX_ADAPTIVE_CHUNK_SIZE_BYTES = 32L * 1024L * 1024L
 private const val MAX_EFFECTIVE_CONCURRENCY = 64
+
+/**
+ * 「小文件重复刷流量」的判据：目标字节数 ÷ 文件大小 ≥ 此值，就认为用户是靠反复下载小文件凑量。
+ * 0.6MB gif 刷 5GB ≈ 8800 次，远超阈值；而 200MB 文件刷 5GB 只有 25 次，不触发。
+ */
+private const val SMALL_FILE_REPEAT_THRESHOLD = 100L
 private const val CRONET_FAILURE_THRESHOLD = 3
-private const val FAST_RETRY_DELAY_MS = 0L
+// M-b 修复：错误重试从零延迟改为指数退避（250ms 起，连续失败翻倍，封顶 10s）
+private const val RETRY_BACKOFF_BASE_MS = 250L
+private const val RETRY_BACKOFF_MAX_MS = 10_000L
+// M-f 修复：Range 支持探测（HEAD + 1 字节 GET）总预算 10 秒
+private const val PROBE_TOTAL_BUDGET_MS = 10_000L
 private const val WORKER_STAGGER_MS = 8L
 private const val QUICK_TRAFFIC_TARGET_GB_TEXT = "0.1"
 // 应用内更新走公开壳仓库 Network-Panel-X-Releases（而非本仓库）：
 // 本仓库历史曾包含未公开信息，壳仓库只存 APK 资产，更新链路与之隔离。
 private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/XiSoul/Network-Panel-X-Releases/releases/latest"
-private const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X-Releases/releases"
+const val GITHUB_RELEASES_URL = "https://github.com/XiSoul/Network-Panel-X-Releases/releases"
 private const val UPDATE_DOWNLOAD_PROXY_PREFIX = "https://ghproxylist.com/"
 const val ACTION_START_FROM_NOTIFICATION = "com.example.networkpanelx.action.START_FROM_NOTIFICATION"
 const val ACTION_STOP_FROM_NOTIFICATION = "com.example.networkpanelx.action.STOP_FROM_NOTIFICATION"
@@ -472,29 +510,11 @@ class MainActivity : ComponentActivity() {
         handleNotificationAction(intent)
         setContent {
             val vm = trafficViewModel
-            MaterialTheme(
-                colorScheme = if (vm.isDarkTheme) {
-                    darkColorScheme(
-                        primary = Color(0xFF8AB4F8),
-                        secondary = Color(0xFF80CBC4),
-                        background = Color(0xFF0F172A),
-                        surface = Color(0xFF1E293B),
-                        surfaceVariant = Color(0xFF334155),
-                    )
-                } else {
-                    lightColorScheme(
-                        primary = Color(0xFF2563EB),
-                        secondary = Color(0xFF0891B2),
-                        background = Color(0xFFF1F5F9),
-                        surface = Color.White,
-                        surfaceVariant = Color(0xFFE2E8F0),
-                    )
-                },
-            ) {
+            NpxTheme(dark = vm.isDarkTheme) {
                 SystemBarsEffect(isDarkTheme = vm.isDarkTheme)
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background,
+                    color = NpxPalette.bg,
                 ) {
                     TrafficScreen(vm)
                 }
@@ -541,6 +561,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     companion object {
         private const val TAG = "TrafficViewModel"
         private const val BACKUP_PAGE_SIZE = 10
+        // P0-8h 修复③：进程级标志——FGS 存活期间 VM 重建（用户划走再打开）不得触发
+        // 第二次下载循环，否则同批链接双重下载
+        @Volatile
+        private var processRunActive = false
     }
 
     var links by mutableStateOf(emptyList<LinkItem>())
@@ -550,6 +574,14 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     var statusText by mutableStateOf("在管理页配置链接后开始测速")
+        private set
+
+    /**
+     * 最近一次下载错误的可读原因（空 = 无错误）。
+     * 修复前 worker 的异常只写进 consumeTask 内的 firstError，UI 上完全不可见——
+     * 用户只看到「运行中」但 0 B/s，无从自查（明文 http 被 CLEARTEXT 拦掉就是这样被误诊成 CDN 失效的）。
+     */
+    var lastErrorText by mutableStateOf("")
         private set
 
     var threadCount by mutableIntStateOf(8)
@@ -562,6 +594,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var keepAliveEnabled by mutableStateOf(true)
         private set
+
+    // P0-8h 修复③：恢复检查只跑一次，避免 init 期间 Compose 重组触发重复启动
+    private var autoResumeChecked = false
     var keepScreenAwakeEnabled by mutableStateOf(true)
         private set
     var progressNotificationEnabled by mutableStateOf(true)
@@ -585,6 +620,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     private val cloudSessionStore = CloudSessionStore(app)
     private var cloudSession: CloudSession? = cloudSessionStore.load()
+    // 云端链接同步守卫：只有先成功读取过云端快照，才允许回传本机快照，
+    // 否则登录/首次同步时会把本机少量链接覆盖掉账号里的链接（数据丢失）。
+    @Volatile
+    private var cloudSnapshotReady = false
     private val deviceTrafficContributionStore = DeviceTrafficContributionStore(app)
     private val backupConnectionStore = BackupConnectionStore(app)
     var backupConnection by mutableStateOf(backupConnectionStore.load())
@@ -666,9 +705,14 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private var cronetEngine: CronetEngine? = null
     private var cronetReadyAttempted = false
 
+    // 下载专用 OkHttpClient 单例（懒初始化）。原来每个 worker 新建一个 client + ConnectionPool(1,1,1s)，
+    // 64 worker = 64 个独立池 + 每个 Range 请求重新握手；共享单例 + 大池才能打满 CDN 带宽。
+    @Volatile
+    private var downloadClientInstance: OkHttpClient? = null
+
     // Process-lifetime scope for the download run: survives Activity destruction and
-    // ViewModel onCleared(). Previously the run lived in viewModelScope, so the OS
-    // reclaiming the backgrounded Activity silently killed overnight downloads.
+    // ViewModel onCleared(). Previously the run lived in viewModelScope, so the OS reclaiming
+    // the backgrounded Activity silently killed overnight downloads.
     private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     init {
@@ -681,6 +725,59 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         if (keepAliveEnabled) syncKeepAliveService()
         restoreLocalJsonBackupIfNeeded()
         refreshPublicIpInfo()
+        // 已登录态：启动时后台同步一次账号链接（登录后自动同步的补充）
+        syncCloudLinksOnStartup()
+        // P0-8h 修复③：进程被系统杀后重启，自动续跑未完成的批次（断点续传）
+        maybeAutoResumeInterruptedRun()
+    }
+
+    // P0-8h 修复③：进程死亡后重启的自动续跑。条件：上次运行异常中断（标记未清）+
+    // 标记年龄 < 24h + 后台常驻开启 + 有可续跑的任务。正常结束/用户停止会清标记，
+    // 不会循环重启；坏链接最多被跳过后批次自然结束（配合修复①）。
+    private fun maybeAutoResumeInterruptedRun() {
+        if (autoResumeChecked) return
+        autoResumeChecked = true
+        val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
+        if (!prefs.getBoolean(PREF_AUTO_RESUME, false)) return
+        val startedAt = prefs.getLong(PREF_AUTO_RESUME_AT, 0L)
+        val age = System.currentTimeMillis() - startedAt
+        if (startedAt <= 0L || age < 0L || age > AUTO_RESUME_MAX_AGE_MS) {
+            prefs.edit().remove(PREF_AUTO_RESUME).remove(PREF_AUTO_RESUME_AT).apply()
+            return
+        }
+        if (!keepAliveEnabled) return
+        if (isRunning) return
+        if (processRunActive) {
+            // 进程活着、下载循环还在跑——只是 VM 被重建了，无需也不允许再起一个
+            Log.i(TAG, "run still active in process, skip auto-resume")
+            return
+        }
+        // 有未完成的已勾选链接才值得续跑
+        if (!hasEnabledValidLinks()) {
+            prefs.edit().remove(PREF_AUTO_RESUME).remove(PREF_AUTO_RESUME_AT).apply()
+            return
+        }
+        Log.i(TAG, "auto-resuming interrupted run (age=${age / 1000}s)")
+        statusText = "检测到上次运行被系统中断，自动续跑未完成任务"
+        // 一次性消费标记：start() 里若真跑起来会重新 set；若任务其实已完成（parsed 空）
+        // 则不会留下僵尸标记导致每次启动空跑
+        prefs.edit().remove(PREF_AUTO_RESUME).remove(PREF_AUTO_RESUME_AT).apply()
+        // 自动续跑不能清零断点，否则"续跑"变成"从头开始"
+        start(resetCompleted = false)
+    }
+
+    private fun markAutoResumeActive() {
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, 0).edit()
+            .putBoolean(PREF_AUTO_RESUME, true)
+            .putLong(PREF_AUTO_RESUME_AT, System.currentTimeMillis())
+            .apply()
+    }
+
+    private fun clearAutoResume() {
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, 0).edit()
+            .remove(PREF_AUTO_RESUME)
+            .remove(PREF_AUTO_RESUME_AT)
+            .apply()
     }
 
     fun refreshPublicIpInfo() {
@@ -723,9 +820,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
     fun updateThreadCount(value: Int) {
         threadCount = value.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
-        if (!isRunning) {
-            activeThreadCount = threadCount
-        }
+        // 运行中也要同步「活跃线程」显示，否则界面上的数字会一直是启动时的旧值。
+        // 实际并发由 worker 循环每轮重算 desiredThreads 决定，这里只是让 UI 如实反映用户设定。
+        activeThreadCount = threadCount
         persistSettings()
     }
 
@@ -777,6 +874,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     fun logoutCloudAccount() {
         cloudSessionStore.clear()
         cloudSession = null
+        cloudSnapshotReady = false
         stopAutoCloudSync()
         cloudUsername = ""
         cloudStatus = "未登录"
@@ -999,6 +1097,15 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
         statsLoading = true
         viewModelScope.launch {
+            // 首次同步前先读一次云端快照（保证链接先落地，再允许回传，避免覆盖账号数据）
+            if (!cloudSnapshotReady) {
+                runCatching { CloudApi.downloadProfileSnapshot(session) }.getOrNull()?.let { document ->
+                    runCatching {
+                        if (links.isEmpty()) restoreBackupDocument(document) else mergeLinksFromCloud(document)
+                    }
+                    cloudSnapshotReady = true
+                }
+            }
             runCatching {
                 val today = LocalDate.now().toString()
                 val cloudDayBeforeSync = CloudApi.personalStats(session, "day")
@@ -1020,6 +1127,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 val selectedStats = if (period == "day") cloudDayAfterSync else CloudApi.personalStats(session, period)
                 restoreDailyTrafficFromCloud(cloudDayAfterSync)
                 val snapshotError = runCatching {
+                    // 守卫：必须先成功读过云端快照才允许回传，否则会把本机链接覆盖账号数据
+                    if (!cloudSnapshotReady) {
+                        throw IllegalStateException("尚未读取云端快照")
+                    }
                     CloudApi.uploadProfileSnapshot(session, createBackupDocument())
                 }.exceptionOrNull()
                 CloudSyncResult(
@@ -1089,17 +1200,104 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 cloudSessionStore.save(session)
                 cloudSession = session
                 cloudUsername = session.username
-                if (links.isEmpty()) {
-                    runCatching { CloudApi.downloadProfileSnapshot(session) }
-                        .getOrNull()
-                        ?.let(::restoreBackupDocument)
+                // 登录后无条件同步账号里的链接：
+                // - 本机无链接 → 全量恢复云端快照（含设置）
+                // - 本机已有链接 → 按 URL 合并（云端链接优先，本地独有链接保留，不丢数据）
+                var syncedCount = 0
+                var syncError: Throwable? = null
+                runCatching { CloudApi.downloadProfileSnapshot(session) }
+                    .onSuccess { document ->
+                        if (document != null) {
+                            syncedCount = if (links.isEmpty()) {
+                                runCatching { restoreBackupDocument(document) }
+                                    .also { if (it.isFailure) syncError = it.exceptionOrNull() }
+                                    .map { links.size }
+                                    .getOrDefault(0)
+                            } else {
+                                runCatching { mergeLinksFromCloud(document) }
+                                    .also { if (it.isFailure) syncError = it.exceptionOrNull() }
+                                    .getOrDefault(0)
+                            }
+                            cloudSnapshotReady = syncError == null
+                        }
+                    }
+                    .onFailure { syncError = it }
+                cloudStatus = when {
+                    syncError != null -> "登录成功，链接同步失败：${syncError?.message ?: "网络异常"}"
+                    syncedCount > 0 -> "登录成功 · 已同步 $syncedCount 条链接"
+                    else -> "登录成功"
                 }
-                cloudStatus = "登录成功"
                 refreshCloudStats("day", isManual = false)
                 startAutoCloudSync()
             } catch (error: Throwable) {
                 cloudStatus = error.message ?: "登录失败"
             }
+        }
+    }
+
+    /**
+     * 把云端快照里的链接合并进本机（登录/启动同步用）：
+     * - 云端顺序优先；URL 相同的沿用本地 id 与已消耗字节，元数据以云端为准
+     * - 云端没有的本地链接原样保留（避免用户本地新增内容被抹掉）
+     * 返回合并后计入的云端链接数。
+     */
+    private fun mergeLinksFromCloud(document: JSONObject): Int {
+        val arr = document.optJSONArray("links") ?: return 0
+        val cloudLinks = buildList {
+            for (index in 0 until arr.length()) {
+                val item = arr.optJSONObject(index) ?: continue
+                val url = item.optString("url").trim()
+                if (url.isEmpty()) continue
+                add(
+                    LinkItem(
+                        id = 0L,
+                        name = item.optString("name"),
+                        url = url,
+                        targetGbText = item.optString("targetGbText"),
+                        userAgent = item.optString("userAgent"),
+                        enabled = item.optBoolean("enabled", true),
+                    ),
+                )
+            }
+        }
+        if (cloudLinks.isEmpty()) return 0
+        val localByUrl = links.associateBy { it.url.trim() }
+        var nextLocalId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
+        val merged = mutableListOf<LinkItem>()
+        cloudLinks.forEach { cloud ->
+            val local = localByUrl[cloud.url.trim()]
+            merged += if (local != null) {
+                local.copy(
+                    name = cloud.name.ifBlank { local.name },
+                    targetGbText = cloud.targetGbText.ifBlank { local.targetGbText },
+                    userAgent = cloud.userAgent,
+                    enabled = cloud.enabled,
+                )
+            } else {
+                cloud.copy(id = nextLocalId++)
+            }
+        }
+        val cloudUrls = cloudLinks.map { it.url.trim() }.toSet()
+        links.filter { it.url.trim() !in cloudUrls }.forEach { merged += it }
+        links = merged
+        nextId = (links.maxOfOrNull { it.id } ?: 0L) + 1L
+        persistLinks()
+        return cloudLinks.size
+    }
+
+    /** 启动时（已有登录态）后台同步一次账号链接，失败静默 */
+    private fun syncCloudLinksOnStartup() {
+        val session = cloudSession ?: return
+        viewModelScope.launch {
+            runCatching { CloudApi.downloadProfileSnapshot(session) }
+                .onSuccess { document ->
+                    if (document != null) {
+                        runCatching {
+                            if (links.isEmpty()) restoreBackupDocument(document) else mergeLinksFromCloud(document)
+                        }
+                        cloudSnapshotReady = true
+                    }
+                }
         }
     }
 
@@ -1302,6 +1500,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         currentSpeedBytesPerSec = 0L
         cronetConsecutiveFailures.set(0L)
         cronetTemporarilyDisabled = false
+        // P0-8h 修复③：用户主动暂停，不自动恢复（尊重用户意图）
+        clearAutoResume()
         syncKeepAliveService()
         links = links.map {
             if (it.status == "运行中") it.copy(status = "已停止") else it
@@ -1349,12 +1549,38 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         startParsedTasks(
             parsed = parsed,
             initialStatusText = "一键测流开始，共 ${parsed.size} 个链接，每条 ${QUICK_TRAFFIC_TARGET_GB_TEXT}GB，线程数 $threadCount",
+            markResumable = false,
         )
         return true
     }
 
-    fun start() {
+    fun start(resetCompleted: Boolean = true) {
         if (isRunning) return
+
+        // 用户点「开始」是明确的重新开始意图：把已完成（consumedBytes >= 目标）的链接
+        // 的计数归零，否则这些链接会被 parseTasks 跳过，parsed 为空时界面只显示
+        // 「所选链接已完成」，用户看到的就是「点击开始没反应」。
+        // 只重置"已达标"的链接，未完成的保留断点继续跑。
+        // resetCompleted=false 用于自动续跑场景（不能把断点清零）。
+        if (resetCompleted) {
+            val resetDone = links.map { item ->
+                val gb = item.targetGbText.trim().toDoubleOrNull()
+                if (!item.enabled || gb == null || gb <= 0.0) {
+                    item
+                } else {
+                    val target = (gb * BYTES_PER_GB).toLong()
+                    if (target > 0L && item.consumedBytes >= target) {
+                        item.copy(consumedBytes = 0L, status = "未开始")
+                    } else {
+                        item
+                    }
+                }
+            }
+            if (resetDone != links) {
+                links = resetDone
+                persistLinks()
+            }
+        }
 
         val parsed = parseTasks()
         if (parsed.isEmpty()) {
@@ -1372,7 +1598,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         )
     }
 
-    private fun startParsedTasks(parsed: List<ParsedTask>, initialStatusText: String) {
+    private fun startParsedTasks(parsed: List<ParsedTask>, initialStatusText: String, markResumable: Boolean = true) {
         activeRunTargets = parsed.associate { it.id to it.targetBytes }
         cronetConsecutiveFailures.set(0L)
         cronetTemporarilyDisabled = false
@@ -1399,8 +1625,13 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         statusText = initialStatusText
         syncKeepAliveService()
         startAutoCloudSync()
+        // P0-8h 修复③：批次进行中持久化标记，进程被杀后重启可自动续跑
+        // （一键测流传 markResumable=false：0.1GB 快测被杀后不应自动重跑消耗流量）
+        if (markResumable) markAutoResumeActive()
 
         runJob = appScope.launch(Dispatchers.IO) {
+            processRunActive = true
+            var failedCount = 0
             for ((index, task) in parsed.withIndex()) {
                 if (!isActive) break
 
@@ -1423,21 +1654,25 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                         links = links.map {
                             if (it.id == task.id) it.copy(status = "完成", consumedBytes = task.targetBytes) else it
                         }
+                        // 任务成功收尾清掉上一条的错误提示，避免误导
+                        lastErrorText = ""
+                        // P0-8h 修复③：单任务完成的断点立即落盘
+                        persistLinks()
                     }
                 } catch (_: CancellationException) {
+                    processRunActive = false
                     return@launch
                 } catch (e: Exception) {
+                    // P0-8h 修复①：单条失败（含 15 秒 watchdog 网络抖动）只跳过该链接，
+                    // 不再放弃整个批次——挂机过夜时一次抖动不再全军覆没
+                    failedCount++
                     withContext(Dispatchers.Main) {
                         links = links.map {
                             if (it.id == task.id) it.copy(status = "失败") else it
                         }
-                        statusText = "链接失败：${e.message ?: "未知错误"}"
-                        isRunning = false
-                        stopAutoCloudSync()
+                        statusText = "第 ${index + 1} 个链接失败（${e.message ?: "未知错误"}），跳过继续"
                         currentSpeedBytesPerSec = 0L
-                        syncKeepAliveService()
                     }
-                    return@launch
                 }
             }
 
@@ -1446,11 +1681,17 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 stopAutoCloudSync()
                 currentSpeedBytesPerSec = 0L
                 syncKeepAliveService()
+                // P0-8h 修复③：批次正常走完（含失败跳过），清除自动续跑标记
+                clearAutoResume()
+                processRunActive = false
                 statusText = when {
-                    links.any { it.status == "失败" } -> "执行结束，存在失败链接"
+                    failedCount > 0 && links.any { it.status == "完成" } -> "执行结束，${failedCount} 个链接失败（已跳过），其余完成"
+                    failedCount > 0 -> "执行结束，全部 ${failedCount} 个链接失败"
                     links.any { it.status == "已停止" } -> "已停止"
                     else -> "全部完成"
                 }
+                // 批次正常结束时清掉错误提示（失败原因已并入 statusText 的计数汇总）
+                if (failedCount == 0) lastErrorText = ""
             }
         }
     }
@@ -1488,7 +1729,21 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private suspend fun probeRangeSupport(url: String, userAgent: String?): Pair<Boolean, Long> = withContext(Dispatchers.IO) {
+    private suspend fun probeRangeSupport(url: String, userAgent: String?): Pair<Boolean, Long> {
+        // M-f 修复：探测整体加 10 秒预算。慢 CDN / 重定向循环不再卡住任务启动 25s+，
+        // 超时按不支持 Range 降级直接开跑（全量下载模式）。
+        // 只捕获 TimeoutCancellationException——外部取消（用户停止任务）正常传播
+        return try {
+            withTimeout(PROBE_TOTAL_BUDGET_MS) {
+                probeRangeSupportInner(url, userAgent)
+            }
+        } catch (e: TimeoutCancellationException) {
+            Log.w(TAG, "probeRangeSupport timed out after ${PROBE_TOTAL_BUDGET_MS}ms: $url")
+            false to -1L
+        }
+    }
+
+    private suspend fun probeRangeSupportInner(url: String, userAgent: String?): Pair<Boolean, Long> = withContext(Dispatchers.IO) {
         val minRangeSize = MIN_ADAPTIVE_CHUNK_SIZE_BYTES
         try {
             val requestBuilder = Request.Builder()
@@ -1503,6 +1758,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                     return@withContext true to length
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
             // Some CDN links, including cloud.139.com APK links, reject HEAD with 403
             // but still support byte ranges. Fall through to a 1-byte range probe.
@@ -1523,6 +1780,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                     return@withContext true to totalLength
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {
         }
 
@@ -1536,12 +1795,27 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         var smoothedSpeed = 0L
         val lastProgressAt = AtomicLong(System.currentTimeMillis())
         val firstError = AtomicReference<String?>(null)
+        // 失败原因上屏（节流 3s，避免每 worker 每秒刷一次重组）
+        val lastErrorPushAt = AtomicLong(0L)
+        suspend fun pushError(raw: String?) {
+            val text = raw?.trim().orEmpty()
+            if (text.isEmpty()) return
+            val now = System.currentTimeMillis()
+            if (now - lastErrorPushAt.get() < 3_000L) return
+            lastErrorPushAt.set(now)
+            val friendly = friendlyErrorText(text)
+            withContext(Dispatchers.Main) { if (lastErrorText != friendly) lastErrorText = friendly }
+            Log.w(TAG, "download error: $text")
+        }
+        withContext(Dispatchers.Main) { if (lastErrorText.isNotEmpty()) lastErrorText = "" }
         val (supportsRange, contentLength) = probeRangeSupport(task.url, task.userAgent)
         activeRangeChunkSizeBytes.set(chooseChunkSizeForContent(contentLength, 0L))
+        Log.i(TAG, "task probe: range=$supportsRange len=$contentLength adaptiveThreads=${adaptiveConcurrencyFor(contentLength, threadCount, task.targetBytes)} (requested=$threadCount target=${task.targetBytes}) url=${task.url.take(60)}")
         val nextRangeStart = AtomicLong(0L)
 
         coroutineScope {
             val progressJob = launch(Dispatchers.Default) {
+                var tick = 0
                 while (currentCoroutineContext().isActive) {
                     delay(1000)
                     val now = System.currentTimeMillis()
@@ -1564,6 +1838,14 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                         updateBackgroundNotification()
                     }
 
+                    // P2 修复：每 30 秒落盘一次（原来每秒写 prefs）
+                    tick += 1
+                    if (tick % 30 == 0) {
+                        withContext(Dispatchers.Main) { flushDailyTrafficIfDirty(false) }
+                        // P0-8h 修复③：断点数据定期落盘，被杀后重启可从 consumedBytes 续跑
+                        withContext(Dispatchers.Main) { persistLinks() }
+                    }
+
                     if (hasReachedTarget(snapshot, task.targetBytes)) break
                 }
             }
@@ -1573,8 +1855,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                     val buffer = ByteArray(READ_BUFFER_SIZE)
                     val downloadClient = buildDownloadClient()
                     delay(index * WORKER_STAGGER_MS)
+                    // M-b 修复：每个 worker 的重试退避状态（成功后归零）
+                    var retryBackoffMs = RETRY_BACKOFF_BASE_MS
                     while (currentCoroutineContext().isActive && !hasReachedTarget(consumed.get(), task.targetBytes)) {
-                        val desiredThreads = computeActiveThreadCount(smoothedSpeed, contentLength)
+                        val desiredThreads = computeActiveThreadCount(smoothedSpeed, contentLength, task.targetBytes)
                         if (index >= desiredThreads) {
                             delay(200)
                             continue
@@ -1600,11 +1884,16 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                                     if (statusCode in 400..499) {
                                         throw FatalRequestException("请求失败：$message")
                                 }
-                                delay(FAST_RETRY_DELAY_MS)
+                                delay(retryBackoffMs)
+                                retryBackoffMs = (retryBackoffMs * 2).coerceAtMost(RETRY_BACKOFF_MAX_MS)
                                 continue
                             }
                         } else {
-                                val rangeHeader = nextRangeHeader(supportsRange, contentLength, nextRangeStart)
+                                // 小文件不分片：走整文件 GET，让每个 worker 独立下一份完整文件。
+                                // 分片在 0.6MB 文件上会让 TTFB(50ms) 压过传输(30ms)，反而更慢。
+                                val isSmallFile = contentLength in 1..SMALL_FILE_NO_SLICE_BYTES
+                                val rangeHeader = if (isSmallFile) null
+                                                  else nextRangeHeader(supportsRange, contentLength, nextRangeStart)
                                 openDownloadStream(task.url, rangeHeader, downloadClient, task.userAgent).use { streamResult ->
                                     if (streamResult.code !in 200..299) {
                                         val message = "HTTP ${streamResult.code}"
@@ -1612,24 +1901,31 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                                         if (streamResult.code in 400..499) {
                                             throw FatalRequestException("请求失败：$message")
                                         }
-                                        delay(FAST_RETRY_DELAY_MS)
+                                        delay(retryBackoffMs)
+                                        retryBackoffMs = (retryBackoffMs * 2).coerceAtMost(RETRY_BACKOFF_MAX_MS)
                                         return@use
                                     }
                                     val stream = streamResult.inputStream ?: return@use
+                                    var readAny = false
                                     while (currentCoroutineContext().isActive && !hasReachedTarget(consumed.get(), task.targetBytes)) {
                                         val read = stream.read(buffer)
                                         if (read <= 0) break
                                         if (hasReachedTarget(consumed.get(), task.targetBytes)) break
                                         addConsumedSafely(consumed, task.targetBytes, read.toLong())
                                         lastProgressAt.set(System.currentTimeMillis())
+                                        readAny = true
                                     }
+                                    if (readAny) retryBackoffMs = RETRY_BACKOFF_BASE_MS
                                 }
                             }
                             if (currentCoroutineContext().isActive && !hasReachedTarget(consumed.get(), task.targetBytes)) {
-                                delay(FAST_RETRY_DELAY_MS)
+                                // 小文件整份下完立刻重来（5ms），大文件分片之间用退避值
+                                val loopDelay = if (contentLength in 1..SMALL_FILE_NO_SLICE_BYTES) SMALL_FILE_LOOP_DELAY_MS else retryBackoffMs
+                                if (loopDelay > 0L) delay(loopDelay)
                             }
                         } catch (e: FatalRequestException) {
                             firstError.compareAndSet(null, e.message ?: e.javaClass.simpleName)
+                            pushError(e.message ?: e.javaClass.simpleName)
                             throw e
                         } catch (e: CancellationException) {
                             throw e
@@ -1640,21 +1936,39 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                                 Log.w(TAG, "Cronet disabled after repeated failures: ${e.message}")
                             }
                             firstError.compareAndSet(null, e.message ?: e.javaClass.simpleName)
-                            delay(FAST_RETRY_DELAY_MS)
+                            pushError(e.message ?: e.javaClass.simpleName)
+                            delay(retryBackoffMs)
+                            retryBackoffMs = (retryBackoffMs * 2).coerceAtMost(RETRY_BACKOFF_MAX_MS)
                         } catch (e: Exception) {
                             firstError.compareAndSet(null, e.message ?: e.javaClass.simpleName)
-                            delay(FAST_RETRY_DELAY_MS)
+                            pushError(e.message ?: e.javaClass.simpleName)
+                            delay(retryBackoffMs)
+                            retryBackoffMs = (retryBackoffMs * 2).coerceAtMost(RETRY_BACKOFF_MAX_MS)
                         }
                     }
                 }
             }
 
+            var noDataStrikes = 0
+            var lastStrikeCheckConsumed = -1L
             while (currentCoroutineContext().isActive && !hasReachedTarget(consumed.get(), task.targetBytes)) {
                 val now = System.currentTimeMillis()
                 if (now - lastProgressAt.get() > 15_000L) {
-                    currentCoroutineContext().cancelChildren()
-                    val reason = firstError.get()?.let { "，最近错误：$it" } ?: ""
-                    throw IllegalStateException("15秒内无有效数据，请检查链接可用性$reason")
+                    // P0-8h 修复②：瞬时网络抖动（ISP 凌晨重拨/CDN 节点切换）不再直接判死——
+                    // 先重置计时器给重连一个窗口，连续 3 轮无数据才放弃该链接
+                    noDataStrikes++
+                    if (noDataStrikes >= 3) {
+                        currentCoroutineContext().cancelChildren()
+                        val reason = firstError.get()?.let { "，最近错误：$it" } ?: ""
+                        throw IllegalStateException("约45秒内无有效数据，已重试3轮，请检查链接可用性$reason")
+                    }
+                    // 重置计时器，给重连一个新的 15 秒窗口
+                    lastProgressAt.set(now)
+                    Log.w(TAG, "no data for 15s (strike $noDataStrikes/3), workers keep retrying: ${task.url}")
+                } else if (consumed.get() != lastStrikeCheckConsumed) {
+                    // 数据恢复流动后清零 strike 计数（三次独立抖动不会累积误杀）
+                    lastStrikeCheckConsumed = consumed.get()
+                    noDataStrikes = 0
                 }
                 delay(100)
             }
@@ -1667,6 +1981,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 currentTaskConsumed = finalConsumed
                 currentSpeedBytesPerSec = 0L
                 updateConsumed(task.id, finalConsumed)
+                // P2 修复：任务收尾强制落盘，保证崩溃/停止也不丢当日统计
+                flushDailyTrafficIfDirty(true)
             }
         }
     }
@@ -1780,18 +2096,41 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun buildDownloadClient(): OkHttpClient {
-        return OkHttpClient.Builder()
+    /**
+     * 下载用 OkHttpClient。
+     * 修复：原来每次 new worker 都新建一个 OkHttpClient，且池是 ConnectionPool(1, 1, 1s)——
+     * 每池只留 1 条连接、1 秒就过期，64 worker = 64 个独立池 + 每个 Range 请求都重新 TCP/TLS 握手。
+     * 实测同一应用宝 CDN 大文件：这样只能跑 136MB/s，而 NAS 侧 curl 复用长连接能到 203MB/s。
+     * 现在改为进程内共享单例 + 足够大的池（keepAlive 5 分钟），让 Range 请求复用连接。
+     */
+    private fun downloadClient(): OkHttpClient = downloadClientInstance ?: synchronized(this) {
+        downloadClientInstance ?: OkHttpClient.Builder()
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .retryOnConnectionFailure(true)
             .protocols(listOf(Protocol.HTTP_1_1))
-            .connectionPool(ConnectionPool(1, 1, TimeUnit.SECONDS))
+            // P0 修复：共享单例后必须放开 Dispatcher 的并发上限。
+            // OkHttp 默认 maxRequestsPerHost = 5，64 个 worker 共用单例时会被压到 5 并发，
+            // 真机上咪咕单流 ~10.6MB/s × 5 ≈ 53MB/s，表现为"网速很慢"。
+            // 容器里测不出来是因为 5 个连接就能跑满容器 138MB/s 天花板。
+            .dispatcher(Dispatcher().apply {
+                maxRequests = MAX_EFFECTIVE_CONCURRENCY * 4
+                maxRequestsPerHost = MAX_EFFECTIVE_CONCURRENCY * 4
+            })
+            .connectionPool(ConnectionPool(MAX_EFFECTIVE_CONCURRENCY * 2, 5, TimeUnit.MINUTES))
             .build()
+            .also { downloadClientInstance = it }
     }
 
+    private fun buildDownloadClient(): OkHttpClient = downloadClient()
+
     private fun applyUserAgentHeader(builder: Request.Builder, userAgent: String?) {
-        builder.header("User-Agent", userAgent.orEmpty())
+        // L-ua 修复：UA 为空时不发送空 User-Agent 头（部分 CDN 对空 UA 敏感直接 403），
+        // 省略该头让 OkHttp/系统默认 UA 自然生效
+        val ua = userAgent?.trim().orEmpty()
+        if (ua.isNotEmpty()) {
+            builder.header("User-Agent", ua)
+        }
     }
 
     private suspend fun openDownloadStream(url: String, rangeHeader: String?, downloadClient: OkHttpClient, userAgent: String?): StreamResult {
@@ -1805,7 +2144,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                         readTimeout = 15_000
                         instanceFollowRedirects = true
                         setRequestProperty("Accept", "*/*")
-                        setRequestProperty("User-Agent", userAgent.orEmpty())
+                        // L-ua：UA 为空时不发送空头（与 OkHttp 路径行为一致）
+                        userAgent?.trim()?.takeIf { it.isNotEmpty() }?.let {
+                            setRequestProperty("User-Agent", it)
+                        }
                         setRequestProperty("Cache-Control", "no-store")
                         if (rangeHeader != null) {
                             setRequestProperty("Range", rangeHeader)
@@ -1871,6 +2213,8 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                     put("targetGbText", item.targetGbText)
                     put("userAgent", item.userAgent)
                     put("enabled", item.enabled)
+                    // P0-8h 修复③：断点数据一并持久化，被杀重启后才能续跑
+                    put("consumedBytes", item.consumedBytes)
                 }
             )
         }
@@ -1883,11 +2227,12 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun schedulePublicJsonBackup() {
-        val document = createBackupDocument().toString()
         publicBackupWriteJob?.cancel()
         publicBackupWriteJob = viewModelScope.launch {
             delay(400)
+            // M-d 修复：JSON 序列化从调用者线程（常为主线程）挪到 IO 线程
             withContext(Dispatchers.IO) {
+                val document = createBackupDocument().toString()
                 PublicJsonBackup.write(getApplication(), document)
             }
         }
@@ -1896,10 +2241,17 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private fun loadLinks() {
         val prefs = getApplication<Application>().getSharedPreferences(PREFS_NAME, 0)
         val raw = prefs.getString(PREF_LINKS, null) ?: return
-        val array = JSONArray(raw)
+        // R1 修复：links_json 损坏时不再让 ViewModel 构造崩溃（启动即崩且用户无法自救），
+        // 解析失败回退空列表并清除坏数据，让用户可进 App 重新配置
+        val array = runCatching { JSONArray(raw) }.getOrNull()
+        if (array == null) {
+            Log.w(TAG, "links_json corrupted, resetting to empty list")
+            runCatching { prefs.edit().remove(PREF_LINKS).apply() }
+            return
+        }
         val loaded = mutableListOf<LinkItem>()
         for (i in 0 until array.length()) {
-            val obj = array.getJSONObject(i)
+            val obj = runCatching { array.getJSONObject(i) }.getOrNull() ?: continue
             loaded += LinkItem(
                 id = obj.optLong("id", i.toLong() + 1L),
                 name = obj.optString("name", ""),
@@ -1907,6 +2259,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 targetGbText = obj.optString("targetGbText", ""),
                 userAgent = obj.optString("userAgent", ""),
                 enabled = obj.optBoolean("enabled", true),
+                consumedBytes = obj.optLong("consumedBytes", 0L).coerceAtLeast(0L),
             )
         }
         links = loaded
@@ -2020,11 +2373,21 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             dailyTaskCount = 0
         }
         dailyTrafficBytes += bytes
-        persistDailyTraffic(today, dailyTrafficBytes, dailyTaskCount)
+        // P2 修复：不再每秒同步写盘/写云贡献存储。
+        // 内存累加 + 脏标记，由 flushDailyTrafficIfDirty() 定期（及任务结束/停止时）落盘。
+        dailyTrafficDirty = true
         cloudSession?.let { session ->
             deviceTrafficContributionStore.recordLocalTraffic(session, today, bytes, 0)
         }
     }
+
+    private fun flushDailyTrafficIfDirty(force: Boolean) {
+        if (!dailyTrafficDirty && !force) return
+        persistDailyTraffic(LocalDate.now().toString(), dailyTrafficBytes, dailyTaskCount)
+        dailyTrafficDirty = false
+    }
+
+    private var dailyTrafficDirty = false
 
     private fun addDailyTaskCount(count: Int) {
         if (count <= 0) return
@@ -2054,29 +2417,100 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     private fun currentRangeChunkSizeBytes(): Long = activeRangeChunkSizeBytes.get()
         .coerceIn(MIN_ADAPTIVE_CHUNK_SIZE_BYTES, MAX_ADAPTIVE_CHUNK_SIZE_BYTES)
 
+    /**
+     * 动态切片：分片大小按「传输时长 ≥ TTFB 的 3 倍」反推，而不是按文件大小拍脑袋。
+     *
+     * 原来按文件大小分档（0.6MB→32KB）会让小文件每片只传 4ms、却付 50ms 的 TTFB，
+     * 切片开销占 90%+。现在按实测速度算：chunk = speed × 3 × TTFB，
+     * 速度慢时自动缩小分片（保证多线程同时开工），速度快时自动放大（减少请求数）。
+     */
     private fun chooseChunkSizeForContent(contentLength: Long, speedBytesPerSec: Long): Long {
-        val baseChunk = when {
-            contentLength in 1..(2L * 1024L * 1024L) -> 128L * 1024L
-            contentLength in 1..(16L * 1024L * 1024L) -> 512L * 1024L
+        // 小文件走整文件模式，不分片
+        if (contentLength in 1..SMALL_FILE_NO_SLICE_BYTES) {
+            return contentLength.coerceIn(MIN_ADAPTIVE_CHUNK_SIZE_BYTES, MAX_ADAPTIVE_CHUNK_SIZE_BYTES)
+        }
+        // 还没测到速度（刚启动）：按文件大小给一个保守初值，后续每秒按实测速度重算
+        val initial = when {
+            contentLength in 1..(16L * 1024L * 1024L) -> 256L * 1024L
             contentLength in 1..(128L * 1024L * 1024L) -> 2L * 1024L * 1024L
             contentLength in 1..(1024L * 1024L * 1024L) -> 4L * 1024L * 1024L
             contentLength in 1..(4L * 1024L * 1024L * 1024L) -> 8L * 1024L * 1024L
             contentLength > 0L -> 16L * 1024L * 1024L
             else -> DEFAULT_ADAPTIVE_CHUNK_SIZE_BYTES
         }
-        val speedAdjustedChunk = when {
-            speedBytesPerSec >= 160L * 1024L * 1024L -> max(baseChunk, 32L * 1024L * 1024L)
-            speedBytesPerSec >= 60L * 1024L * 1024L -> max(baseChunk, 16L * 1024L * 1024L)
-            else -> baseChunk
+        if (speedBytesPerSec <= 0L) {
+            return initial.coerceIn(MIN_ADAPTIVE_CHUNK_SIZE_BYTES, MAX_ADAPTIVE_CHUNK_SIZE_BYTES)
         }
-        return speedAdjustedChunk.coerceIn(MIN_ADAPTIVE_CHUNK_SIZE_BYTES, MAX_ADAPTIVE_CHUNK_SIZE_BYTES)
+        // 动态：每片传输时长 ≈ 3 × TTFB（50ms），既不让请求数爆炸也不让 TTFB 占比过高
+        val dynamic = speedBytesPerSec * (3L * TTFB_BUDGET_MS) / 1000L
+        // 不要超过文件的 1/8（否则并发铺不开），也不要小于 32KB
+        val maxUseful = (contentLength / 8L).coerceAtLeast(MIN_ADAPTIVE_CHUNK_SIZE_BYTES)
+        return dynamic.coerceIn(MIN_ADAPTIVE_CHUNK_SIZE_BYTES, minOf(maxUseful, MAX_ADAPTIVE_CHUNK_SIZE_BYTES))
     }
 
-    private fun computeActiveThreadCount(speedBytesPerSec: Long, contentLength: Long): Int {
-        val desired = threadCount.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
-        activeThreadCount = desired
+    /**
+     * 把底层异常文本翻译成用户能看懂的自查提示。
+     * 尤其是 CLEARTEXT：明文 http 被系统拦掉时异常文本是
+     * "CLEARTEXT communication to xxx not permitted by network security policy"，
+     * 用户看到原文完全无法行动，翻译后能直接指向「换 https 链接」。
+     */
+    private fun friendlyErrorText(raw: String): String {
+        val lower = raw.lowercase()
+        return when {
+            lower.contains("cleartext") ->
+                "链接是明文 http，被系统拦截（改用 https 链接）"
+            lower.contains("timeout") || lower.contains("timed out") ->
+                "连接超时（服务器无响应或网络不通）"
+            lower.contains("unknownhost") || lower.contains("unable to resolve") ->
+                "域名解析失败（检查域名拼写或 DNS）"
+            lower.contains("ssl") || lower.contains("certificate") || lower.contains("handshake") ->
+                "TLS/证书错误（https 握手失败）"
+            lower.contains("http 403") || lower.contains("请求失败：403") ->
+                "服务器拒绝访问 403（可能需 UA 或该链接对当前出口限流）"
+            lower.contains("http 404") || lower.contains("请求失败：404") ->
+                "链接已失效 404（请更换下载地址）"
+            lower.contains("http 4") ->
+                "服务器返回 ${raw.substringAfter("HTTP ").take(3)}，链接不可用"
+            lower.contains("econnreset") || lower.contains("connection reset") ->
+                "连接被重置（服务器主动断开）"
+            lower.contains("failed to connect") || lower.contains("connectexception") ->
+                "无法建立连接（网络或服务器不可达）"
+            else -> raw.take(80)
+        }
+    }
+
+    private fun computeActiveThreadCount(speedBytesPerSec: Long, contentLength: Long, targetBytes: Long = 0L): Int {
+        val desired = adaptiveConcurrencyFor(contentLength, threadCount, targetBytes)
         activeRangeChunkSizeBytes.set(chooseChunkSizeForContent(contentLength, speedBytesPerSec))
         return desired
+    }
+
+    /**
+     * 并发数决策。
+     *
+     * 关键区分（2026-10-30 真机反馈修复）：
+     *  - 「一次性下载小文件」：文件 <2MB 时 4 线程够用，64 并发只是白白堆连接。
+     *  - 「小文件重复刷大流量」：同一个 0.6MB gif 要刷 5GB，等于重复下载 8000+ 次。
+     *    这时并发数就是吞吐量本身——4 线程实测只有 1.91MB/s，用户体感"网速很慢"。
+     *    判据是「目标字节数 ÷ 文件大小」的重复次数：超过 [SMALL_FILE_REPEAT_THRESHOLD] 次
+     *    就不再降并发，按用户设定跑。
+     */
+    private fun adaptiveConcurrencyFor(contentLength: Long, requested: Int, targetBytes: Long = 0L): Int {
+        val maxAllowed = requested.coerceIn(1, MAX_EFFECTIVE_CONCURRENCY)
+        if (contentLength <= 0L) return maxAllowed   // 未知长度：用用户设定
+        // 小文件被反复下载凑流量时，并发就是吞吐量，不能按"文件小"去压
+        if (targetBytes > 0L && contentLength > 0L) {
+            val repeats = targetBytes / contentLength
+            if (repeats >= SMALL_FILE_REPEAT_THRESHOLD) return maxAllowed
+        }
+        val cap = when {
+            contentLength < 2L * 1024L * 1024L -> 4     // <2MB：单次秒完，4 线程足够
+            contentLength < 32L * 1024L * 1024L -> 8    // <32MB
+            contentLength < 128L * 1024L * 1024L -> 16  // <128MB
+            contentLength < 512L * 1024L * 1024L -> 32  // <512MB
+            else -> maxAllowed                          // 大文件：用户设定（可到 64）
+        }
+        return cap.coerceIn(1, maxAllowed)
     }
 
 
@@ -2134,79 +2568,11 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     }
 }
 
-@Composable
-fun TrafficScreen(vm: TrafficViewModel) {
-    var page by rememberSaveable { mutableIntStateOf(0) }
-
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp),
-    ) {
-        Card(
-            modifier = Modifier.fillMaxWidth(),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primary),
-            elevation = CardDefaults.cardElevation(defaultElevation = 4.dp),
-        ) {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(18.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text(
-                        text = "网络面板X",
-                        style = MaterialTheme.typography.headlineMedium,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                        fontWeight = FontWeight.Bold,
-                    )
-                    Text(
-                        text = "批量流量任务 · 实时测速面板",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onPrimary.copy(alpha = 0.82f),
-                    )
-                }
-                IconButton(onClick = { vm.toggleTheme() }) {
-                    Icon(
-                        painter = painterResource(
-                            id = if (vm.isDarkTheme) R.drawable.ic_theme_light else R.drawable.ic_theme_dark
-                        ),
-                        contentDescription = if (vm.isDarkTheme) "切换到白天主题" else "切换到黑夜主题",
-                        modifier = Modifier.size(26.dp),
-                        tint = MaterialTheme.colorScheme.onPrimary,
-                    )
-                }
-            }
-        }
-
-        TabRow(
-            selectedTabIndex = page,
-            containerColor = MaterialTheme.colorScheme.surface,
-            contentColor = MaterialTheme.colorScheme.primary,
-        ) {
-            Tab(selected = page == 0, onClick = { page = 0 }, text = { Text("测速") })
-            Tab(selected = page == 1, onClick = { page = 1 }, text = { Text("链接管理") })
-            Tab(selected = page == 2, onClick = { page = 2 }, text = { Text("统计") })
-            Tab(selected = page == 3, onClick = { page = 3 }, text = { Text("设置") })
-        }
-
-        when (page) {
-            0 -> SpeedPanel(vm)
-            1 -> LinkManagePanel(vm = vm, onQuickTrafficStarted = { page = 0 })
-            2 -> StatsPanel(vm)
-            else -> SettingsPanel(vm)
-        }
-    }
-}
-
+// TrafficScreen / 新 SpeedPanel 已迁移到 NpxNewUi.kt（2026-10-25 定稿新 UI）。
+// 旧版 SpeedPanel 保留为 LegacySpeedPanel 供对照，不再挂载。
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
-private fun SpeedPanel(vm: TrafficViewModel) {
+private fun LegacySpeedPanel(vm: TrafficViewModel) {
     val context = LocalContext.current
     val qqGroup = "1074735930"
     val hasFiniteTotalTarget = vm.totalTargetBytes > 0L
@@ -2342,7 +2708,7 @@ private fun SpeedPanel(vm: TrafficViewModel) {
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsPanel(vm: TrafficViewModel) {
+fun SettingsPanel(vm: TrafficViewModel) {
     val context = LocalContext.current
     var savedUserAgentName by rememberSaveable { mutableStateOf("") }
     val localJsonImportLauncher = rememberLauncherForActivityResult(
@@ -2510,17 +2876,20 @@ private fun SettingsPanel(vm: TrafficViewModel) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun BackupPanel(vm: TrafficViewModel) {
+fun BackupPanel(vm: TrafficViewModel) {
     val saved = vm.backupConnection
     var provider by rememberSaveable { mutableStateOf(saved.provider) }
     var webDavUrl by rememberSaveable { mutableStateOf(saved.webDavUrl) }
     var webDavUsername by rememberSaveable { mutableStateOf(saved.webDavUsername) }
-    var webDavPassword by rememberSaveable { mutableStateOf(saved.webDavPassword) }
+    // S2 修复：密码类字段用 remember（不参与 saved-instance-state 序列化），
+    // 进程死亡后从 EncryptedSharedPreferences 重读，避免明文密码进系统存档 blob
+    var webDavPassword by remember { mutableStateOf(saved.webDavPassword) }
     var s3Endpoint by rememberSaveable { mutableStateOf(saved.s3Endpoint) }
     var s3Region by rememberSaveable { mutableStateOf(saved.s3Region) }
     var s3Bucket by rememberSaveable { mutableStateOf(saved.s3Bucket) }
     var s3AccessKey by rememberSaveable { mutableStateOf(saved.s3AccessKey) }
-    var s3SecretKey by rememberSaveable { mutableStateOf(saved.s3SecretKey) }
+    // S2 修复：同上，Secret Key 不进 saved-instance-state
+    var s3SecretKey by remember { mutableStateOf(saved.s3SecretKey) }
     var s3ObjectPrefix by rememberSaveable { mutableStateOf(saved.s3ObjectPrefix) }
     var selectedBackup by remember { mutableStateOf<RemoteBackup?>(null) }
 
@@ -2699,7 +3068,7 @@ private fun BackupPanel(vm: TrafficViewModel) {
     }
 }
 
-private fun formatBackupTime(epochMs: Long): String {
+fun formatBackupTime(epochMs: Long): String {
     if (epochMs <= 0L) return "时间未知"
     return Instant.ofEpochMilli(epochMs)
         .atZone(ZoneId.systemDefault())
@@ -2708,7 +3077,7 @@ private fun formatBackupTime(epochMs: Long): String {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun CloudAccountPanel(vm: TrafficViewModel) {
+fun CloudAccountPanel(vm: TrafficViewModel) {
     var username by rememberSaveable { mutableStateOf(vm.savedCloudUsername) }
     var password by remember { mutableStateOf(vm.savedCloudPassword) }
     var rememberPassword by rememberSaveable { mutableStateOf(vm.savedCloudPassword.isNotBlank()) }
@@ -2810,7 +3179,7 @@ private fun CloudAccountPanel(vm: TrafficViewModel) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun StatsPanel(vm: TrafficViewModel) {
+fun StatsPanel(vm: TrafficViewModel) {
     var period by rememberSaveable { mutableStateOf("day") }
     val labels = mapOf("day" to "日", "month" to "月", "year" to "年")
     LaunchedEffect(vm.cloudUsername) {
@@ -2898,7 +3267,7 @@ private fun StatsPanel(vm: TrafficViewModel) {
 }
 
 @Composable
-private fun BackgroundSettingsPanel(
+fun BackgroundSettingsPanel(
     vm: TrafficViewModel,
     onRequestNotificationPermission: () -> Unit,
     onRequestBatteryExemption: () -> Unit,
@@ -3007,7 +3376,7 @@ private fun BackgroundSettingRow(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun UpdatePanel(vm: TrafficViewModel, context: Context) {
+fun UpdatePanel(vm: TrafficViewModel, context: Context) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -3095,7 +3464,7 @@ private fun UpdatePanel(vm: TrafficViewModel, context: Context) {
     }
 }
 
-private fun openExternalLink(context: Context, url: String) {
+fun openExternalLink(context: Context, url: String) {
     try {
         context.startActivity(
             Intent(Intent.ACTION_VIEW, Uri.parse(url)).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
@@ -3108,7 +3477,7 @@ private fun openExternalLink(context: Context, url: String) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun UserAgentDropdown(
+fun UserAgentDropdown(
     label: String,
     value: String,
     options: List<SavedUserAgent>,
@@ -3180,7 +3549,7 @@ private fun MetricCard(label: String, value: String, modifier: Modifier = Modifi
 }
 
 @Composable
-private fun PublicIpCard(vm: TrafficViewModel) {
+fun PublicIpCard(vm: TrafficViewModel) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(20.dp),
@@ -3241,7 +3610,7 @@ private fun SystemBarsEffect(isDarkTheme: Boolean) {
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
-private fun LinkManagePanel(
+fun LinkManagePanel(
     vm: TrafficViewModel,
     onQuickTrafficStarted: () -> Unit,
 ) {
@@ -3426,16 +3795,22 @@ private class StreamResult(
     }
 }
 
-private fun formatTargetBytes(bytes: Long): String {
+fun formatTargetBytes(bytes: Long): String {
     return if (isUnlimitedTarget(bytes)) "无限" else formatBytes(bytes)
 }
 
-private fun formatBytes(bytes: Long): String {
+fun formatBytes(bytes: Long): String {
     if (bytes <= 0L) return "0 B"
     val kb = 1024.0
     val mb = kb * 1024.0
     val gb = mb * 1024.0
+    val tb = gb * 1024.0
+    val pb = tb * 1024.0
+    val eb = pb * 1024.0
     return when {
+        bytes >= eb -> String.format("%.3f EB", bytes / eb)
+        bytes >= pb -> String.format("%.3f PB", bytes / pb)
+        bytes >= tb -> String.format("%.3f TB", bytes / tb)
         bytes >= gb -> String.format("%.2f GB", bytes / gb)
         bytes >= mb -> String.format("%.2f MB", bytes / mb)
         bytes >= kb -> String.format("%.2f KB", bytes / kb)
@@ -3443,7 +3818,7 @@ private fun formatBytes(bytes: Long): String {
     }
 }
 
-private fun formatDuration(totalSec: Long): String {
+fun formatDuration(totalSec: Long): String {
     if (totalSec < 0L) return "-"
     val h = totalSec / 3600
     val m = (totalSec % 3600) / 60

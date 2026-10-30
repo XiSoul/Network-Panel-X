@@ -219,7 +219,13 @@ class TrafficKeepAliveService : Service() {
         val kb = 1024.0
         val mb = kb * 1024.0
         val gb = mb * 1024.0
+        val tb = gb * 1024.0
+        val pb = tb * 1024.0
+        val eb = pb * 1024.0
         return when {
+            bytes >= eb -> String.format("%.3f EB", bytes / eb)
+            bytes >= pb -> String.format("%.3f PB", bytes / pb)
+            bytes >= tb -> String.format("%.3f TB", bytes / tb)
             bytes >= gb -> String.format("%.2f GB", bytes / gb)
             bytes >= mb -> String.format("%.2f MB", bytes / mb)
             bytes >= kb -> String.format("%.2f KB", bytes / kb)
