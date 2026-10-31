@@ -172,7 +172,9 @@ jobs:
             gh release edit "$RELEASE_TAG" --repo "$REPO" --latest
           fi
 
-          gh release view "$RELEASE_TAG" --repo "$REPO" --json tagName,isLatest,assets,url
+          # 注意：gh release view 不支持 isLatest 字段，latest 状态要另外查
+          gh release view "$RELEASE_TAG" --repo "$REPO" --json tagName,assets,url
+          echo "当前仓库 latest = $(gh release view --repo "$REPO" --json tagName -q .tagName)"
 
       - name: Remove signing material
         if: always()
