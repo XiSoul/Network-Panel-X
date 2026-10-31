@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 1.0.27 — 2026-10-31
+
+### 发布链路重构（无用户可见行为改动）
+
+本次是**发版基础设施**升级，App 功能与 1.0.26 完全一致：
+
+- **APK 发布位置改正**：应用内「检查更新」读的是公开发行仓库
+  `XiSoul/Network-Panel-X-Releases` 的 `releases/latest`，而此前 CI 一直把 release
+  发到源码仓库，导致 1.0.20~1.0.26 全部没有进入更新通道（用户点检查更新只会看到
+  「已是最新」）。现在 CI 通过 `RELEASES_REPO_TOKEN` 跨仓库发到发行仓库。
+- **密钥与生产配置迁到私有仓库**：签名 keystore 与真实云端 API 地址移入私有仓库
+  `XiSoul/Network-Panel-X-Private`，公开源码仓只保留 `BuildConfig` 占位版本，
+  由 CI 在构建时从 Actions secrets 注入真实地址。
+- **latest 标记加版本守卫**：`/releases/latest` 按创建时间排序，补发或重跑旧版本会把
+  latest 拽回旧版、让 App 提示降级。CI 现按 `sort -V` 比较版本，只有不低于当前
+  latest 才抢占 latest 标记。
+- **清理源码仓 release**：源码仓库的 18 个历史 release 已删除（tag 保留），
+  APK 唯一存放地为发行仓库。
+
+### 验证
+
+- 本地 `assembleRelease` 通过；`apksigner` 校验 v2+v3 均为 true，证书 SHA-256
+  与正式密钥一致（`AA:CF:D1:6A:…:9F:23`）。
+- 包内 `DEFAULT_CLOUD_API_URL` 已注入真实生产地址（源码仍为占位符）。
+- CI workflow `workflow_dispatch` 全步骤通过，资产落到发行仓库且 latest 指向本版本。
+
 ## 1.0.26 — 2026-10-30
 
 ### 改动三项（用户真机反馈）
