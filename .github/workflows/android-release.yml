@@ -140,16 +140,39 @@ jobs:
         run: |
           test -n "$GH_TOKEN" || { echo "缺少 secret RELEASES_REPO_TOKEN"; exit 1; }
           REPO="XiSoul/Network-Panel-X-Releases"
+
+          # 只有「本次版本 >= 当前 latest」才允许抢占 latest。
+          # 补发旧版本（例如重跑 v1.0.20）绝不能把 latest 拽回去，
+          # 否则 App 内更新会提示降级。
+          CUR_LATEST=$(gh release view --repo "$REPO" --json tagName -q .tagName 2>/dev/null || true)
+          if [ -z "$CUR_LATEST" ]; then
+            IS_NEWEST=1
+          elif [ "$(printf '%s\n%s\n' "$CUR_LATEST" "$RELEASE_TAG" | sort -V | tail -n 1)" = "$RELEASE_TAG" ]; then
+            IS_NEWEST=1
+          else
+            IS_NEWEST=0
+          fi
+          echo "当前 latest=$CUR_LATEST，本次=$RELEASE_TAG，抢占 latest=$IS_NEWEST"
+
           if gh release view "$RELEASE_TAG" --repo "$REPO" > /dev/null 2>&1; then
             echo "release $RELEASE_TAG 已存在，改为上传/覆盖资产"
             gh release upload "$RELEASE_TAG" "$ASSET" --repo "$REPO" --clobber
           else
+            LATEST_FLAG="--latest=false"
+            [ "$IS_NEWEST" = "1" ] && LATEST_FLAG="--latest"
             gh release create "$RELEASE_TAG" "$ASSET" \
               --repo "$REPO" \
               --title "Network Panel X $VERSION_NAME" \
-              --notes-file release-notes.md
+              --notes-file release-notes.md \
+              "$LATEST_FLAG"
           fi
-          gh release view "$RELEASE_TAG" --repo "$REPO" --json tagName,assets,url
+
+          # 已存在的 release 重跑时，gh create 不会执行，需显式纠正 latest 标记
+          if [ "$IS_NEWEST" = "1" ]; then
+            gh release edit "$RELEASE_TAG" --repo "$REPO" --latest
+          fi
+
+          gh release view "$RELEASE_TAG" --repo "$REPO" --json tagName,isLatest,assets,url
 
       - name: Remove signing material
         if: always()
