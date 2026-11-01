@@ -74,6 +74,7 @@ fun TrafficScreen(vm: TrafficViewModel) {
         // ============ 顶部 header ============
         NpxHeader(
             isRunning = vm.isRunning,
+            statusText = vm.statusText,
             isDark = vm.isDarkTheme,
             onToggleTheme = { vm.toggleTheme() },
         )
@@ -97,7 +98,7 @@ fun TrafficScreen(vm: TrafficViewModel) {
 }
 
 @Composable
-private fun NpxHeader(isRunning: Boolean, isDark: Boolean, onToggleTheme: () -> Unit) {
+private fun NpxHeader(isRunning: Boolean, statusText: String, isDark: Boolean, onToggleTheme: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -121,7 +122,7 @@ private fun NpxHeader(isRunning: Boolean, isDark: Boolean, onToggleTheme: () -> 
         }
         Row(verticalAlignment = Alignment.CenterVertically) {
             // 状态药丸（呼吸点）
-            StatusPill(isRunning = isRunning)
+            StatusPill(isRunning = isRunning, statusText = statusText)
             Spacer(modifier = Modifier.width(14.dp))
             // 主题切换按钮
             Box(
@@ -149,10 +150,15 @@ private fun NpxHeader(isRunning: Boolean, isDark: Boolean, onToggleTheme: () -> 
 }
 
 @Composable
-private fun StatusPill(isRunning: Boolean) {
-    val label = when {
-        isRunning -> "运行中"
-        else -> "待开始"
+private fun StatusPill(isRunning: Boolean, statusText: String) {
+    // 状态文案与配色，语义与链接列表圆点保持一致：
+    // 运行中=蓝、待开始=黄、完成=绿、失败=红、已停止=灰
+    val (label, pillColor) = when {
+        isRunning -> "运行中" to NpxPalette.runningBlue
+        statusText.contains("失败") -> "有失败" to NpxPalette.failRed
+        statusText.contains("全部完成") || statusText.contains("完成") -> "已完成" to NpxPalette.doneGreen
+        statusText.contains("已停止") -> "已停止" to NpxPalette.idleGray
+        else -> "待开始" to NpxPalette.waitingYellow
     }
     // 呼吸动画
     val transition = rememberInfiniteTransition(label = "pill")
@@ -170,14 +176,14 @@ private fun StatusPill(isRunning: Boolean) {
             modifier = Modifier
                 .size(7.dp)
                 .alpha(if (isRunning) alpha else 1f)
-                .background(NpxPalette.accent, CircleShape),
+                .background(pillColor, CircleShape),
         )
         Spacer(modifier = Modifier.width(6.dp))
         Text(
             text = label,
             fontSize = 11.sp,
             fontWeight = FontWeight.Medium,
-            color = NpxPalette.accent,
+            color = pillColor,
         )
     }
 }
@@ -457,8 +463,8 @@ private fun NewSpeedPanel(vm: TrafficViewModel) {
             CircuitRow(
                 name = link.name.ifBlank { "未命名链接" },
                 meta = when (link.status) {
-                    "完成" -> "${formatBytes(link.consumedBytes)} / ${formatTargetBytes(if (link.targetGbText.toDoubleOrNull() != null && link.targetGbText.toDouble() > 0) (link.targetGbText.toDouble() * BYTES_PER_GB).toLong() else 0L)} · 已完成"
-                    "运行中" -> "${formatBytes(link.consumedBytes)} / ${formatTargetBytes(if (link.targetGbText.toDoubleOrNull() != null && link.targetGbText.toDouble() > 0) (link.targetGbText.toDouble() * BYTES_PER_GB).toLong() else 0L)}"
+                    "完成" -> "${formatBytes(link.consumedBytes)} / ${formatTargetBytes(if (link.targetGbText.toDoubleOrNull() != null && link.targetGbText.toDouble() > 0) (link.targetGbText.toDouble() * bytesPerGigabyte()).toLong() else 0L)} · 已完成"
+                    "运行中" -> "${formatBytes(link.consumedBytes)} / ${formatTargetBytes(if (link.targetGbText.toDoubleOrNull() != null && link.targetGbText.toDouble() > 0) (link.targetGbText.toDouble() * bytesPerGigabyte()).toLong() else 0L)}"
                     "失败" -> "失败 · ${formatBytes(link.consumedBytes)}"
                     "已停止" -> "已停止 · ${formatBytes(link.consumedBytes)}"
                     else -> if (link.enabled) "等待中 · ${formatBytes(link.consumedBytes)}" else "未勾选"

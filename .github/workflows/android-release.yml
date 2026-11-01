@@ -113,6 +113,34 @@ jobs:
           path: ${{ steps.artifact.outputs.file }}
           if-no-files-found: error
 
+      # 混淆映射表：线上崩溃堆栈还原的唯一凭据。
+      # 公开仓库绝不能上传（等于公开混淆答案），改为加密后存进私有仓库的 Release。
+      - name: Publish mapping to private repo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+        run: |
+          MAPPING=app/build/outputs/mapping/release/mapping.txt
+          test -f "$MAPPING" || { echo "缺少 mapping.txt（isMinifyEnabled 未开启？）"; exit 1; }
+          # 用 R8 自身的 retrace 需要原始 mapping，这里原样归档到私有仓库，
+          # 私有仓库本就存放密钥，权限等级一致。
+          PRIV="XiSoul/Network-Panel-X-Private"
+          TAG="mapping-v$VERSION_NAME"
+          ART="mapping-$VERSION_NAME.txt"
+          cp "$MAPPING" "$ART"
+          if gh release view "$TAG" --repo "$PRIV" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$ART" --repo "$PRIV" --clobber
+          else
+            gh release create "$TAG" "$ART" \
+              --repo "$PRIV" \
+              --title "mapping $VERSION_NAME" \
+              --notes "R8 mapping for Network Panel X $VERSION_NAME（线上崩溃堆栈还原用）"
+          fi
+          rm -f "$ART"
+          echo "mapping 已归档: $PRIV release $TAG"
+
+
       - name: Extract changelog section
         id: notes
         shell: bash

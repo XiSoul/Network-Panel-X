@@ -125,7 +125,7 @@ fun NewLinkManagePanel(
             ) { vm.stop() }
             Spacer(modifier = Modifier.weight(1f))
             Text(
-                "每条 0.1GB",
+                "每条 0.1${gigabyteSuffix()}",
                 fontSize = 10.sp,
                 color = NpxPalette.textGhost,
                 modifier = Modifier.align(Alignment.CenterVertically),
@@ -285,7 +285,7 @@ private fun QueueItem(
                 )
                 Spacer(modifier = Modifier.height(2.dp))
                 Text(
-                    "${hostOf(item.url)} · ${item.targetGbText.ifBlank { "?" }} GB" +
+                    "${hostOf(item.url)} · ${item.targetGbText.ifBlank { "?" }} ${gigabyteSuffix()}" +
                         if (item.status == "完成") " · 已完成" else "",
                     fontSize = 10.sp,
                     color = NpxPalette.textGhost,
@@ -320,7 +320,7 @@ private fun QueueItem(
                 NpxField(label = "下载链接 URL", value = item.url, enabled = !locked, singleLine = true, onValueChange = onUrlChange)
                 Spacer(modifier = Modifier.height(10.dp))
                 NpxField(
-                    label = "目标流量 (GB，0=无限)",
+                    label = "目标流量 (${gigabyteSuffix()}，0=无限)",
                     value = item.targetGbText,
                     enabled = !locked,
                     singleLine = true,
@@ -356,7 +356,7 @@ private fun QueueItem(
                 Spacer(modifier = Modifier.height(10.dp))
                 // 消耗读数
                 val gbValue = item.targetGbText.toDoubleOrNull()
-                val targetBytes = gbValue?.takeIf { it > 0.0 }?.let { (it * BYTES_PER_GB).toLong() } ?: 0L
+                val targetBytes = gbValue?.takeIf { it > 0.0 }?.let { (it * bytesPerGigabyte()).toLong() } ?: 0L
                 val remainText = if (gbValue == 0.0) "无限" else formatBytes((targetBytes - item.consumedBytes).coerceAtLeast(0L))
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -649,7 +649,8 @@ fun NewStatsPanel(vm: TrafficViewModel) {
                     overflow = TextOverflow.Ellipsis,
                 )
                 Text(
-                    formatBytes(entry.consumedBytes),
+                    // 榜单固定二进制口径，不随设置里的 GB/GiB 开关变化
+                    formatBytesBinary(entry.consumedBytes),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = NpxPalette.textDim,
@@ -760,6 +761,12 @@ fun NewSettingsPanel(vm: TrafficViewModel) {
                     }
                 }
             }
+            Spacer(modifier = Modifier.height(4.dp))
+        }
+
+        // ---- 流量单位制 ----
+        item {
+            NpxTrafficUnitPanel(vm)
             Spacer(modifier = Modifier.height(4.dp))
         }
 
@@ -910,5 +917,77 @@ fun PadButton(text: String, primary: Boolean, enabled: Boolean = true, onClick: 
                 else -> NpxPalette.textDim
             },
         )
+    }
+}
+
+// ============================================================
+// 流量单位制设置（GB 十进制 / GiB 二进制）
+// ============================================================
+
+/**
+ * 流量单位制切换面板。
+ *
+ * 为什么需要这个开关：
+ *  - 运营商（移动/联通/电信）与手机系统设置按「十进制」计费：1 GB = 1000^3 字节
+ *  - 老版本 App 按「二进制」显示却写 GB：1 GB = 1024^3 字节
+ *  - 两者对同一份流量差约 7%（39 GB 量级差 2.8 GB），用户和账单永远对不上
+ *
+ * 切换后首页 / 链接管理 / 统计 / 通知栏全部即时生效，内部字节数不变。
+ */
+@Composable
+fun NpxTrafficUnitPanel(vm: TrafficViewModel) {
+    NpxGroup(title = "流量单位", hint = "与运营商账单对齐") {
+        Text(
+            "运营商和手机系统按十进制统计（1 GB = 1000 MB）；" +
+                "GiB 是二进制单位（1 GiB = 1024 MiB）。" +
+                "想让 App 数字和移动数据账单对得上，选 GB。",
+            fontSize = 10.sp,
+            color = NpxPalette.textMuted,
+            lineHeight = 14.sp,
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf(
+                TRAFFIC_UNIT_GB to "GB（十进制）",
+                TRAFFIC_UNIT_GIB to "GiB（二进制）",
+            ).forEach { (key, label) ->
+                val selected = vm.trafficUnit == key
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(5.dp))
+                        .background(
+                            if (selected) NpxPalette.accent
+                            else androidx.compose.ui.graphics.Color.Transparent
+                        )
+                        .then(
+                            if (!selected) {
+                                Modifier.border(1.dp, NpxPalette.divider, RoundedCornerShape(5.dp))
+                            } else Modifier
+                        )
+                        .clickable { vm.updateTrafficUnit(key) }
+                        .padding(horizontal = 14.dp, vertical = 7.dp),
+                ) {
+                    Text(
+                        label,
+                        fontSize = 12.sp,
+                        fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                        color = if (selected) NpxPalette.onAccent else NpxPalette.textFaint,
+                    )
+                }
+            }
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+        // 实时示例：用同一份字节数展示两种口径的差异，让用户直观看到区别
+        SettingRow(
+            title = "当前显示示例",
+            desc = "同一份 39.08 GiB 流量，两种口径的读法不同",
+        ) {
+            Text(
+                formatBytes((39.08 * 1024.0 * 1024.0 * 1024.0).toLong()),
+                fontSize = 13.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = NpxPalette.textDim,
+            )
+        }
     }
 }

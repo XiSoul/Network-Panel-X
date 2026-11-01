@@ -155,6 +155,12 @@ private const val PREF_AUTO_RESUME = "auto_resume_run"
 private const val PREF_AUTO_RESUME_AT = "auto_resume_started_at"
 private const val AUTO_RESUME_MAX_AGE_MS = 24 * 60 * 60 * 1000L
 private const val PREF_PROGRESS_NOTIFICATION = "progress_notification"
+/** 流量显示单位制：GB=十进制(1000，与运营商口径一致) / GiB=二进制(1024，传统习惯) */
+private const val PREF_TRAFFIC_UNIT = "traffic_unit"
+const val TRAFFIC_UNIT_GB = "gb"
+const val TRAFFIC_UNIT_GIB = "gib"
+/** 默认 GiB：保持老版本 1024 进制显示不变，避免升级后数字突然变小 */
+const val DEFAULT_TRAFFIC_UNIT = TRAFFIC_UNIT_GIB
 private const val PREF_DAILY_TRAFFIC_DATE = "daily_traffic_date"
 private const val PREF_DAILY_TRAFFIC_BYTES = "daily_traffic_bytes"
 private const val PREF_DAILY_TASK_COUNT = "daily_task_count"
@@ -168,7 +174,7 @@ private const val PREF_PUBLIC_BACKUP_URI = "public_backup_uri"
 private const val LEGACY_ANDROID_APP_USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; Network-Panel-X Build/UP1A.231005.007)"
 private const val COMMON_ANDROID_USER_AGENT = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Mobile Safari/537.36"
 private const val DEFAULT_USER_AGENT = COMMON_ANDROID_USER_AGENT
-const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
+const val BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0  // 兼容保留；实际换算请用 bytesPerGigabyte()
 private const val READ_BUFFER_SIZE = 1024 * 1024
 private const val DEFAULT_ADAPTIVE_CHUNK_SIZE_BYTES = 2L * 1024L * 1024L
 
@@ -193,7 +199,7 @@ private const val SMALL_FILE_LOOP_DELAY_MS = 5L
  * 否则请求建立开销主导，切片越细越慢。
  */
 private const val TTFB_BUDGET_MS = 50L
-private const val MIN_ADAPTIVE_CHUNK_SIZE_BYTES = 32L * 1024L
+private const val MIN_ADAPTIVE_CHUNK_SIZE_BYTES = 1024L * 1024L
 private const val MAX_ADAPTIVE_CHUNK_SIZE_BYTES = 32L * 1024L * 1024L
 private const val MAX_EFFECTIVE_CONCURRENCY = 64
 
@@ -600,6 +606,9 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
     var keepScreenAwakeEnabled by mutableStateOf(true)
         private set
     var progressNotificationEnabled by mutableStateOf(true)
+        private set
+    /** 流量单位制：gb（十进制，对齐运营商）/ gib（二进制，传统）。切换后全局 formatBytes 立即生效。 */
+    var trafficUnit by mutableStateOf(DEFAULT_TRAFFIC_UNIT)
         private set
     var notificationPermissionGranted by mutableStateOf(true)
         private set
@@ -1408,6 +1417,20 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         updateBackgroundNotification()
     }
 
+    /**
+     * 切换流量单位制。同步更新全局 [trafficUnitMode]，
+     * 让首页/链接管理/统计里所有 formatBytes 调用立即按新单位渲染。
+     */
+    fun updateTrafficUnit(unit: String) {
+        val normalized = if (unit == TRAFFIC_UNIT_GB) TRAFFIC_UNIT_GB else TRAFFIC_UNIT_GIB
+        trafficUnit = normalized
+        trafficUnitMode = normalized
+        getApplication<Application>().getSharedPreferences(PREFS_NAME, 0).edit()
+            .putString(PREF_TRAFFIC_UNIT, normalized)
+            .apply()
+        persistSettings()
+    }
+
     fun refreshBackgroundSystemStatus() {
         val app = getApplication<Application>()
         notificationPermissionGranted = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
@@ -1517,7 +1540,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             return false
         }
 
-        val quickTargetBytes = (QUICK_TRAFFIC_TARGET_GB_TEXT.toDouble() * BYTES_PER_GB).toLong()
+        val quickTargetBytes = (QUICK_TRAFFIC_TARGET_GB_TEXT.toDouble() * bytesPerGigabyte()).toLong()
         val parsed = mutableListOf<ParsedTask>()
         links = links.map { item ->
             if (!item.enabled) {
@@ -1548,7 +1571,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
         startParsedTasks(
             parsed = parsed,
-            initialStatusText = "一键测流开始，共 ${parsed.size} 个链接，每条 ${QUICK_TRAFFIC_TARGET_GB_TEXT}GB，线程数 $threadCount",
+            initialStatusText = "一键测流开始，共 ${parsed.size} 个链接，每条 ${QUICK_TRAFFIC_TARGET_GB_TEXT}${gigabyteSuffix()}，线程数 $threadCount",
             markResumable = false,
         )
         return true
@@ -1568,7 +1591,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                 if (!item.enabled || gb == null || gb <= 0.0) {
                     item
                 } else {
-                    val target = (gb * BYTES_PER_GB).toLong()
+                    val target = (gb * bytesPerGigabyte()).toLong()
                     if (target > 0L && item.consumedBytes >= target) {
                         item.copy(consumedBytes = 0L, status = "未开始")
                     } else {
@@ -1587,7 +1610,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             statusText = if (hasEnabledValidLinks()) {
                 "所选链接已完成，可修改目标后重跑"
             } else {
-                "请在管理页勾选并填写有效链接（URL + 目标GB）"
+                "请在管理页勾选并填写有效链接（URL + 目标${gigabyteSuffix()}）"
             }
             return
         }
@@ -1650,9 +1673,27 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
 
                 try {
                     consumeTask(task)
+                    // 修复「没跑够却记成完成」：
+                    // 原来无条件写 consumedBytes = task.targetBytes，
+                    // 导致中途断网/失败时实际只下了 934MB，界面却显示 3.00GB 完成。
+                    // 现在按真实计数收尾：达到目标才算完成，没达到就是「失败」。
+                    val actualConsumed = runCatching {
+                        links.firstOrNull { it.id == task.id }?.consumedBytes
+                    }.getOrNull() ?: 0L
+                    val reached = isUnlimitedTarget(task.targetBytes) ||
+                        actualConsumed >= task.targetBytes
                     withContext(Dispatchers.Main) {
                         links = links.map {
-                            if (it.id == task.id) it.copy(status = "完成", consumedBytes = task.targetBytes) else it
+                            if (it.id == task.id) {
+                                it.copy(
+                                    status = if (reached) "完成" else "失败",
+                                    consumedBytes = if (isUnlimitedTarget(task.targetBytes)) actualConsumed else minOf(actualConsumed, task.targetBytes),
+                                )
+                            } else it
+                        }
+                        if (!reached) {
+                            failedCount++
+                            statusText = "第 ${index + 1} 个链接未达目标（实收 ${formatBytes(actualConsumed)} / 目标 ${formatBytes(task.targetBytes)}）"
                         }
                         // 任务成功收尾清掉上一条的错误提示，避免误导
                         lastErrorText = ""
@@ -1704,7 +1745,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             val name = item.name.trim().ifEmpty { "未命名链接" }
             val gb = item.targetGbText.trim().toDoubleOrNull()
             if (url.isEmpty() || gb == null || gb < 0.0) continue
-            val targetBytes = if (gb == 0.0) 0L else (gb * BYTES_PER_GB).toLong()
+            val targetBytes = if (gb == 0.0) 0L else (gb * bytesPerGigabyte()).toLong()
             if (gb > 0.0 && targetBytes <= 0L) continue
             val initialConsumed = if (isUnlimitedTarget(targetBytes)) item.consumedBytes else item.consumedBytes.coerceAtMost(targetBytes)
             if (!isUnlimitedTarget(targetBytes) && initialConsumed >= targetBytes) continue
@@ -1802,6 +1843,11 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             if (text.isEmpty()) return
             val now = System.currentTimeMillis()
             if (now - lastErrorPushAt.get() < 3_000L) return
+            // 修复「部分 worker 失败就报错，但整体在正常跑」：
+            // 只要最近 3 秒内有数据进来，说明整体下载仍在推进，
+            // 单个 worker 的瞬时超时/断连属于正常抖动，不该弹到界面上吓用户。
+            // 真正卡死的情况（全部 worker 都失败）由下方 15s watchdog 判定并抛错。
+            if (now - lastProgressAt.get() < 3_000L) return
             lastErrorPushAt.set(now)
             val friendly = friendlyErrorText(text)
             withContext(Dispatchers.Main) { if (lastErrorText != friendly) lastErrorText = friendly }
@@ -1836,6 +1882,13 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
                         currentSpeedBytesPerSec = smoothedSpeed
                         updateConsumed(task.id, snapshot)
                         updateBackgroundNotification()
+                        // 修复「错误提示挂着不走」：数据恢复流动后自动清除旧错误。
+                        // 之前 pushError 只写不清，一旦某次超时把提示点亮，
+                        // 后续即使下载早已恢复，界面仍一直显示「连接超时」，
+                        // 用户误以为任务卡死（实际在正常跑）。
+                        if (lastErrorText.isNotEmpty() && delta > 0L) {
+                            lastErrorText = ""
+                        }
                     }
 
                     // P2 修复：每 30 秒落盘一次（原来每秒写 prefs）
@@ -1977,7 +2030,15 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             progressJob.cancel()
 
             withContext(Dispatchers.Main) {
-                val finalConsumed = if (isUnlimitedTarget(task.targetBytes)) consumed.get() else task.targetBytes
+                // 修复「没跑够却记成完成」：原来这里对有限目标无条件写 task.targetBytes，
+                // 导致断网/失败时实际只下了 846MB，界面却显示 3.00GB / 100% 完成。
+                // 现在按真实计数收尾，未达标就不该记成目标值。
+                val realConsumed = consumed.get()
+                val finalConsumed = if (isUnlimitedTarget(task.targetBytes)) {
+                    realConsumed
+                } else {
+                    minOf(realConsumed, task.targetBytes)
+                }
                 currentTaskConsumed = finalConsumed
                 currentSpeedBytesPerSec = 0L
                 updateConsumed(task.id, finalConsumed)
@@ -2284,6 +2345,10 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
         keepAliveEnabled = prefs.getBoolean(PREF_KEEP_ALIVE, true)
         keepScreenAwakeEnabled = prefs.getBoolean(PREF_KEEP_SCREEN_AWAKE, true)
         progressNotificationEnabled = prefs.getBoolean(PREF_PROGRESS_NOTIFICATION, true)
+        trafficUnit = prefs.getString(PREF_TRAFFIC_UNIT, DEFAULT_TRAFFIC_UNIT)
+            ?.let { if (it == TRAFFIC_UNIT_GB) TRAFFIC_UNIT_GB else TRAFFIC_UNIT_GIB }
+            ?: DEFAULT_TRAFFIC_UNIT
+        trafficUnitMode = trafficUnit
         refreshBackgroundSystemStatus()
     }
 
@@ -2297,6 +2362,7 @@ class TrafficViewModel(app: Application) : AndroidViewModel(app) {
             .putBoolean(PREF_KEEP_ALIVE, keepAliveEnabled)
             .putBoolean(PREF_KEEP_SCREEN_AWAKE, keepScreenAwakeEnabled)
             .putBoolean(PREF_PROGRESS_NOTIFICATION, progressNotificationEnabled)
+            .putString(PREF_TRAFFIC_UNIT, trafficUnit)
             .apply()
         schedulePublicJsonBackup()
     }
@@ -3647,7 +3713,7 @@ fun LinkManagePanel(
                         Text("一键暂停")
                     }
                 }
-                Text("已勾选：${vm.links.count { it.enabled }} / ${vm.links.size}，一键测流每条 0.1GB")
+                Text("已勾选：${vm.links.count { it.enabled }} / ${vm.links.size}，一键测流每条 ${QUICK_TRAFFIC_TARGET_GB_TEXT}${gigabyteSuffix()}")
             }
         }
 
@@ -3745,7 +3811,7 @@ fun LinkManagePanel(
                                 value = item.targetGbText,
                                 onValueChange = { vm.updateLinkTargetGb(item.id, it) },
                                 modifier = Modifier.fillMaxWidth(),
-                                label = { Text("目标流量 (GB，0=无限)") },
+                                label = { Text("目标流量 (${gigabyteSuffix()}，0=无限)") },
                                 enabled = !vm.isRunning,
                                 singleLine = true,
                                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
@@ -3764,7 +3830,7 @@ fun LinkManagePanel(
                         val gbValue = item.targetGbText.toDoubleOrNull()
                         val targetBytes = gbValue
                             ?.takeIf { it > 0.0 }
-                            ?.let { (it * BYTES_PER_GB).toLong() } ?: 0L
+                            ?.let { (it * bytesPerGigabyte()).toLong() } ?: 0L
                         val remainText = if (gbValue == 0.0) "无限" else formatBytes((targetBytes - item.consumedBytes).coerceAtLeast(0L))
                         Text("本次消耗：${formatBytes(item.consumedBytes)}，目标剩余：$remainText")
                     }
@@ -3799,21 +3865,100 @@ fun formatTargetBytes(bytes: Long): String {
     return if (isUnlimitedTarget(bytes)) "无限" else formatBytes(bytes)
 }
 
+/**
+ * 流量显示单位制（全局可变状态，由设置页切换后即时生效）。
+ *
+ * 背景：运营商与手机系统设置一律按十进制统计
+ * （1 GB = 1000^3 字节），而 Android/传统习惯用二进制（1 GiB = 1024^3 字节）。
+ * 旧版固定按 1024 进制却显示 "GB"，导致 App 数字比运营商小约 7%
+ * （39 GB 量级差 2.8 GB），用户对不上账。
+ *
+ * 现在提供开关：
+ *  - GiB（默认）：显示 xxx GiB / MiB / KiB，数值与旧版完全一致（不改变老用户观感）
+ *  - GB：显示 xxx GB / MB / KB，十进制，与运营商账单口径一致
+ *
+ * 注意：内部一律用字节（Long）存储和传输，单位制只影响「显示」和「输入解析」。
+ */
+/**
+ * 流量显示单位制（全局 Compose 状态）。
+ *
+ * 必须是 mutableStateOf 而不是普通 @Volatile 变量：所有页面的 formatBytes()
+ * 都在 Composable 里读取它，只有可观察状态变化才会触发重组，否则切换单位后
+ * 界面数字不会更新（按钮高亮变了但数值还是旧口径）。
+ */
+val trafficUnitModeState = mutableStateOf(DEFAULT_TRAFFIC_UNIT)
+
+var trafficUnitMode: String
+    get() = trafficUnitModeState.value
+    set(value) { trafficUnitModeState.value = value }
+
+private const val KIB = 1024.0
+private const val MIB = KIB * 1024.0
+private const val GIB = MIB * 1024.0
+private const val TIB = GIB * 1024.0
+private const val PIB = TIB * 1024.0
+private const val EIB = PIB * 1024.0
+
+private const val KB_DEC = 1000.0
+private const val MB_DEC = KB_DEC * 1000.0
+private const val GB_DEC = MB_DEC * 1000.0
+private const val TB_DEC = GB_DEC * 1000.0
+private const val PB_DEC = TB_DEC * 1000.0
+private const val EB_DEC = PB_DEC * 1000.0
+
+/** 当前单位制下 1 GB/GiB 对应的字节数（供目标流量输入框换算用） */
+fun bytesPerGigabyte(): Double =
+    if (trafficUnitMode == TRAFFIC_UNIT_GB) GB_DEC else GIB
+
+/** 当前单位制下的单位后缀，如 "GB" / "GiB" */
+fun gigabyteSuffix(): String = if (trafficUnitMode == TRAFFIC_UNIT_GB) "GB" else "GiB"
+
 fun formatBytes(bytes: Long): String {
     if (bytes <= 0L) return "0 B"
-    val kb = 1024.0
-    val mb = kb * 1024.0
-    val gb = mb * 1024.0
-    val tb = gb * 1024.0
-    val pb = tb * 1024.0
-    val eb = pb * 1024.0
+    return if (trafficUnitMode == TRAFFIC_UNIT_GB) {
+        // 十进制：与运营商/手机系统口径一致
+        when {
+            bytes >= EB_DEC -> String.format("%.3f EB", bytes / EB_DEC)
+            bytes >= PB_DEC -> String.format("%.3f PB", bytes / PB_DEC)
+            bytes >= TB_DEC -> String.format("%.3f TB", bytes / TB_DEC)
+            bytes >= GB_DEC -> String.format("%.2f GB", bytes / GB_DEC)
+            bytes >= MB_DEC -> String.format("%.2f MB", bytes / MB_DEC)
+            bytes >= KB_DEC -> String.format("%.2f KB", bytes / KB_DEC)
+            else -> "$bytes B"
+        }
+    } else {
+        // 二进制：传统习惯，后缀明确写成 GiB/MiB/KiB
+        when {
+            bytes >= EIB -> String.format("%.3f EiB", bytes / EIB)
+            bytes >= PIB -> String.format("%.3f PiB", bytes / PIB)
+            bytes >= TIB -> String.format("%.3f TiB", bytes / TIB)
+            bytes >= GIB -> String.format("%.2f GiB", bytes / GIB)
+            bytes >= MIB -> String.format("%.2f MiB", bytes / MIB)
+            bytes >= KIB -> String.format("%.2f KiB", bytes / KIB)
+            else -> "$bytes B"
+        }
+    }
+}
+
+/** 供非 Composable 的 Service 复用同一套格式化逻辑（如通知栏）。 */
+fun formatBytesGlobal(bytes: Long): String = formatBytes(bytes)
+
+/**
+ * 统计榜单专用：**永远按二进制**（GiB/MiB），不受设置里的 GB/GiB 开关影响。
+ *
+ * 原因：云端榜单是全体用户的横向排名，如果每个人的客户端按不同口径渲染，
+ * 同一个字节数在不同手机上显示成不同数字，排名看起来会自相矛盾。
+ * 所以榜单固定二进制口径，与个人本机统计的口径解耦。
+ */
+fun formatBytesBinary(bytes: Long): String {
+    if (bytes <= 0L) return "0 B"
     return when {
-        bytes >= eb -> String.format("%.3f EB", bytes / eb)
-        bytes >= pb -> String.format("%.3f PB", bytes / pb)
-        bytes >= tb -> String.format("%.3f TB", bytes / tb)
-        bytes >= gb -> String.format("%.2f GB", bytes / gb)
-        bytes >= mb -> String.format("%.2f MB", bytes / mb)
-        bytes >= kb -> String.format("%.2f KB", bytes / kb)
+        bytes >= EIB -> String.format("%.3f EiB", bytes / EIB)
+        bytes >= PIB -> String.format("%.3f PiB", bytes / PIB)
+        bytes >= TIB -> String.format("%.3f TiB", bytes / TIB)
+        bytes >= GIB -> String.format("%.2f GiB", bytes / GIB)
+        bytes >= MIB -> String.format("%.2f MiB", bytes / MIB)
+        bytes >= KIB -> String.format("%.2f KiB", bytes / KIB)
         else -> "$bytes B"
     }
 }

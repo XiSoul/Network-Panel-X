@@ -214,24 +214,13 @@ class TrafficKeepAliveService : Service() {
             .build()
     }
 
-    private fun formatBytes(bytes: Long): String {
-        if (bytes <= 0L) return "0 B"
-        val kb = 1024.0
-        val mb = kb * 1024.0
-        val gb = mb * 1024.0
-        val tb = gb * 1024.0
-        val pb = tb * 1024.0
-        val eb = pb * 1024.0
-        return when {
-            bytes >= eb -> String.format("%.3f EB", bytes / eb)
-            bytes >= pb -> String.format("%.3f PB", bytes / pb)
-            bytes >= tb -> String.format("%.3f TB", bytes / tb)
-            bytes >= gb -> String.format("%.2f GB", bytes / gb)
-            bytes >= mb -> String.format("%.2f MB", bytes / mb)
-            bytes >= kb -> String.format("%.2f KB", bytes / kb)
-            else -> "$bytes B"
-        }
-    }
+    /**
+     * 通知栏也走全局统一的 [formatBytes]，跟随设置里的 GB / GiB 单位制。
+     *
+     * 原来这里有一份独立的、硬编码 1024 进制的实现，
+     * 导致设置里选 GB 后首页显示 3.00 GB、通知栏却显示 2.79 GB，两处对不上。
+     */
+    private fun formatBytes(bytes: Long): String = formatBytesGlobal(bytes)
 
     private fun formatTargetBytes(bytes: Long): String = if (bytes > 0L) formatBytes(bytes) else "无限"
 
